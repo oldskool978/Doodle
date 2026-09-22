@@ -256,7 +256,6 @@ def run_permutation_matrix(engine: Optional[MusicEngine], base_req: GenerationRe
         req.audio_duration = test_duration
         for k, v in overrides.items():
             setattr(req, k, v)
-
         t0 = time.perf_counter()
         try:
             resp = engine.synthesize(req)
@@ -282,6 +281,7 @@ def display_menu(req: GenerationRequest, engine: Optional[MusicEngine] = None) -
     active_lyrics = req.instrumental_lyrics if (is_inst and req.instrumental_branch == "cues") else req.lyrics
     lyrics_status = f"{len(active_lyrics.splitlines())} lines configured" if active_lyrics.strip() else "<Empty Sheet>"
     anchor_tag = "doodle/default.json (Active File)" if has_custom_default_preset() else "Discovered Optimal Baseline (Hardcoded)"
+
     lead_header = "Acoustic Lead:" if is_inst else "Vocal Profile:"
     lead_content = (req.instrumental_lead or req.vocals) if is_inst else (req.vocal_lead or req.vocals)
 
@@ -289,12 +289,14 @@ def display_menu(req: GenerationRequest, engine: Optional[MusicEngine] = None) -
     p_sem = req.top_p if req.top_p is not None else defaults["top_p"]
     k_sem = req.top_k if req.top_k is not None else defaults["top_k"]
     rp_sem = req.repetition_penalty if req.repetition_penalty is not None else defaults["repetition_penalty"]
+
     cot_mode = (req.cot or defaults["cot"]).upper()
     steps = req.num_inference_steps if req.num_inference_steps is not None else defaults["num_inference_steps"]
     method = (req.ode_method or defaults["ode_method"]).upper()
     cfg = req.cfg_scale if req.cfg_scale is not None else defaults["cfg_scale"]
     core_f = req.vae_core_frames if req.vae_core_frames is not None else defaults["vae_core_frames"]
     halo_f = req.vae_halo_frames if req.vae_halo_frames is not None else defaults["vae_halo_frames"]
+
     declick_disp = "ENABLED (Symmetric Hann)" if (req.apply_declick if req.apply_declick is not None else defaults["apply_declick"]) else "DISABLED"
     offload_disp = "ENABLED (Sequential Streaming)" if (req.cpu_offload if req.cpu_offload is not None else defaults["cpu_offload"]) else "DISABLED (Resident VRAM)"
 
@@ -449,6 +451,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
     while True:
         display_menu(req, engine)
         choice = input("Select action or field: ").strip().upper()
+
         if choice == "M":
             req.is_instrumental = not req.is_instrumental
             if req.is_instrumental:
@@ -458,8 +461,10 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 req.vocals = req.vocal_lead or req.vocals
                 req.output_path = "output_vocal_master.wav"
             print(f"\nSwitched modality to: {'INSTRUMENTAL' if req.is_instrumental else 'VOCAL SONG'}")
+
         elif choice == "I":
             prompt_instrumental_menu(req)
+
         elif choice == "1":
             g = input(f"Enter Genre [{req.genre}]: ").strip()
             if g:
@@ -467,18 +472,22 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             sg = input(f"Enter Subgenre [{req.subgenre}]: ").strip()
             if sg:
                 req.subgenre = sg
+
         elif choice == "2":
             b = input(f"Enter BPM (30 - 300, 0 for unmetered) [{req.bpm}]: ").strip()
             if b.isdigit() and (int(b) == 0 or 30 <= int(b) <= 300):
                 req.bpm = int(b)
+
         elif choice == "3":
             k = input(f"Enter Key Signature [{req.key}]: ").strip()
             if k:
                 req.key = k
+
         elif choice == "4":
             m = input(f"Enter Mood Narrative [{req.mood}]: ").strip()
             if m:
                 req.mood = m
+
         elif choice == "5":
             if req.is_instrumental:
                 curr = req.instrumental_lead or req.vocals
@@ -492,18 +501,22 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 if v:
                     req.vocal_lead = v
                     req.vocals = v
+
         elif choice == "6":
             a = input(f"Enter Arrangement Details [{req.arrangement}]: ").strip()
             if a:
                 req.arrangement = a
+
         elif choice == "7":
             r = input("Enter Raw Style override (empty to reset to auto-compiled tags): ").strip()
             req.raw_prompt = r if r else None
+
         elif choice == "E":
             if req.is_instrumental and req.instrumental_branch == "cues":
                 req.instrumental_lyrics = edit_multiline_sheet(req.instrumental_lyrics, is_inst=True)
             else:
                 req.lyrics = edit_multiline_sheet(req.lyrics, is_inst=False)
+
         elif choice == "8":
             t = input(f"Enter Semantic Temperature [{req.temperature}]: ").strip()
             if t:
@@ -517,17 +530,21 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             rp = input(f"Enter Repetition Penalty [{req.repetition_penalty}]: ").strip()
             if rp:
                 req.repetition_penalty = float(rp)
+
         elif choice == "9":
             prompt_cot_menu(req)
+
         elif choice == "10":
             c = input(f"Enter CFG Scale [{req.cfg_scale}]: ").strip()
             if c:
                 req.cfg_scale = float(c)
+
         elif choice == "11":
             prompt_ode_method(req)
             st = input(f"Enter Number of ODE Steps [{req.num_inference_steps}]: ").strip()
             if st and st.isdigit():
                 req.num_inference_steps = int(st)
+
         elif choice == "12":
             cf = input(f"Enter VAE Core Frames (128-4096) [{req.vae_core_frames}]: ").strip()
             if cf and cf.isdigit():
@@ -535,30 +552,38 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             hf = input(f"Enter VAE Halo Frames (>=16) [{req.vae_halo_frames}]: ").strip()
             if hf and hf.isdigit():
                 req.vae_halo_frames = int(hf)
+
         elif choice in ("13", "DUR"):
             d = input(f"Enter Duration Ceiling (seconds) [{req.audio_duration:.2f}]: ").strip()
             if d:
                 req.audio_duration = float(d)
+
         elif choice in ("14", "18"):
             sd = input(f"Enter PRNG Seed [{req.seed}]: ").strip()
             if sd and sd.isdigit():
                 req.seed = int(sd)
+
         elif choice in ("15", "19"):
             dst = input(f"Enter Output WAV Path [{req.output_path}]: ").strip()
             if dst:
                 req.output_path = dst
+
         elif choice in ("16", "21"):
             req.apply_declick = not req.apply_declick
+
         elif choice in ("17", "22"):
             req.cpu_offload = not req.cpu_offload
+
         elif choice == "P":
             branch_label = req.instrumental_branch.upper() if req.is_instrumental else "VOCAL SONG"
             print(f"\n--- Compiled Style Tags ---\n{req.compile_style()}\n")
             print(f"--- Sanitized Sequence (Branch: {branch_label}) ---\n{req.sanitize_lyrics()}\n")
             print(f"--- Full Ingest Prompt ---\n{req.compile_full_text()}\n")
             input("Press Enter to continue...")
+
         elif choice == "TP":
             run_permutation_matrix(engine, req)
+
         elif choice == "T1":
             if engine is None:
                 print("\nInitializing Doodle neural engine...")
@@ -568,13 +593,14 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             test_req.instrumental_branch = "tags_only"
             test_req.vocals = test_req.instrumental_lead or ""
             test_req.output_path = "output_bare_tags.wav"
-            print("\nExecuting Branch A: Bare-Tag Projection...")
+            print("\nExecuting Branch A: Bare-Tag Projection...\n")
             try:
                 resp = engine.synthesize(test_req)
                 print_telemetry(resp, test_req)
             except Exception as e:
                 print(f"Branch A execution failed: {e}", file=sys.stderr)
                 traceback.print_exc()
+
         elif choice == "T2":
             if engine is None:
                 print("\nInitializing Doodle neural engine...")
@@ -586,17 +612,18 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             test_req.output_path = "output_arrangement_cues.wav"
             if not test_req.instrumental_lyrics.strip():
                 test_req.instrumental_lyrics = DEFAULT_HARNESS_INSTRUMENTAL_CUES
-            print("\nExecuting Branch B: Arrangement Directives...")
+            print("\nExecuting Branch B: Arrangement Directives...\n")
             try:
                 resp = engine.synthesize(test_req)
                 print_telemetry(resp, test_req)
             except Exception as e:
                 print(f"Branch B execution failed: {e}", file=sys.stderr)
                 traceback.print_exc()
+
         elif choice == "T":
-            default_fixture = create_default_harness_request()
-            req = default_fixture
+            req = create_default_harness_request()
             print("\nReset active configuration to discovered baseline.")
+
         elif choice == "L":
             p_path = input("Enter JSON preset to load: ").strip()
             if not p_path:
@@ -615,6 +642,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 print(f"Preset loaded successfully from {chosen_path}")
             except Exception as e:
                 print(f"Preset load failure: {e}")
+
         elif choice == "S":
             p_path = input(f"Enter destination JSON preset path (e.g., {DEFAULT_PRESET_FILENAME}): ").strip()
             if not p_path:
@@ -632,6 +660,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 print(f"Preset saved successfully to {target}")
             except Exception as e:
                 print(f"Preset save failure: {e}")
+
         elif choice == "D":
             target = ROOT_DIR / DEFAULT_PRESET_FILENAME
             try:
@@ -639,6 +668,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 print(f"Authoritative default.json updated at {target}")
             except Exception as e:
                 print(f"Preset save failure: {e}")
+
         elif choice == "G":
             if engine is None:
                 print("\nInitializing Doodle neural engine...")
@@ -646,7 +676,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             cot_tag = (req.cot or "full").upper()
             mode_tag = f"INSTRUMENTAL ({req.instrumental_branch.upper()})" if req.is_instrumental else "VOCAL MASTER"
             print(
-                f"\nSynthesizing ({mode_tag}, Ceiling={req.audio_duration:.2f}s, Steps={req.num_inference_steps}, CoT={cot_tag})..."
+                f"\nSynthesizing ({mode_tag}, Ceiling={req.audio_duration:.2f}s, Steps={req.num_inference_steps}, CoT={cot_tag})...\n"
             )
             try:
                 resp = engine.synthesize(req)
@@ -654,6 +684,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             except Exception as e:
                 print(f"Synthesis failed: {e}", file=sys.stderr)
                 traceback.print_exc()
+
         elif choice == "Q":
             sys.exit(0)
 
