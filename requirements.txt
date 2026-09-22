@@ -1,0 +1,7 @@
+transformers
+safetensors
+huggingface-hub
+soundfile
+pydantic
+numpy
+regex
