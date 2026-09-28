@@ -4,16 +4,19 @@ from concurrent.futures import ThreadPoolExecutor
 import ctypes
 import os
 from pathlib import Path
+import re
 import sys
 from typing import (
     AbstractSet,
     Collection,
+    Dict,
     Iterable,
     List,
     Literal,
     Optional,
     Sequence,
     Set,
+    Tuple,
     Union,
 )
 
@@ -80,6 +83,14 @@ class _TikTalkinBinding:
         ]
         self.lib.tiktalkin_decode.restype = ctypes.c_int32
 
+        self.lib.tiktalkin_find_common_prefix.argtypes = [
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.c_uint32,
+        ]
+        self.lib.tiktalkin_find_common_prefix.restype = ctypes.c_uint32
+
         self.lib.tiktalkin_destroy.argtypes = [ctypes.c_void_p]
         self.lib.tiktalkin_destroy.restype = None
 
@@ -132,12 +143,37 @@ def get_binding() -> _TikTalkinBinding:
     return _BINDING
 
 
+def build_default_yue2_specials() -> List[Tuple[str, int]]:
+    specials: List[Tuple[str, int]] = [
+        ("<|endoftext|>", 151643),
+        ("<|im_start|>", 151644),
+        ("<|im_end|>", 151645),
+        ("<R>", 151646),
+        ("<S>", 151647),
+        ("<X>", 151648),
+        ("<mask >", 151649),
+        ("<sep>", 151650),
+    ]
+    for i in range(196):
+        specials.append((f"<extra_{i}>", 151651 + i))
+    specials.append(("<abc>", 151847))
+    specials.append(("</abc>", 151848))
+    specials.append(("<extra_198>", 151849))
+    specials.append(("<extra_199>", 151850))
+    specials.append(("<music_start>", 151851))
+    specials.append(("<music_end>", 151852))
+    specials.append(("<latent_start>", 184621))
+    specials.append(("<latent_end>", 184622))
+    specials.append(("<latent_pad>", 184623))
+    return specials
+
+
 def compile_vocab(
     in_tiktoken_path: Union[str, Path],
     out_bin_path: Union[str, Path],
     out_telemetry_json: Optional[Union[str, Path]] = None,
     regex_pattern: Optional[str] = None,
-    specials_list: Optional[Sequence[tuple[str, int]]] = None,
+    specials_list: Optional[Sequence[Tuple[str, int]]] = None,
     eot_token_id: int = 151643,
 ) -> Telemetry:
     binding = get_binding()
@@ -150,16 +186,16 @@ def compile_vocab(
     )
     pat_str = regex_pattern.encode("utf-8") if regex_pattern else None
 
-    specials_arr = None
-    specials_count = 0
-    if specials_list:
-        specials_count = len(specials_list)
-        specials_arr = (SpecialDisk * specials_count)()
-        for idx, (literal, s_id) in enumerate(specials_list):
-            specials_arr[idx].id = int(s_id)
-            lit_bytes = literal.encode("utf-8")[:57]
-            specials_arr[idx].length = len(lit_bytes)
-            specials_arr[idx].literal = lit_bytes
+    effective_specials = (
+        specials_list if specials_list is not None else build_default_yue2_specials()
+    )
+    specials_count = len(effective_specials)
+    specials_arr = (SpecialDisk * specials_count)()
+    for idx, (literal, s_id) in enumerate(effective_specials):
+        specials_arr[idx].id = int(s_id)
+        lit_bytes = literal.encode("utf-8")[:57]
+        specials_arr[idx].length = len(lit_bytes)
+        specials_arr[idx].literal = lit_bytes
 
     telem = Telemetry()
     rc = binding.lib.tiktalkin_compile_vocab_v4(
@@ -205,6 +241,39 @@ def compile_qwen_ranks_binary(
     return dest_bin
 
 
+def find_common_prefix(
+    tokens_a: Sequence[int],
+    tokens_b: Sequence[int],
+) -> int:
+    len_a = len(tokens_a)
+    len_b = len(tokens_b)
+    limit = len_a if len_a < len_b else len_b
+    if limit == 0:
+        return 0
+
+    if hasattr(tokens_a, "dtype") and hasattr(tokens_b, "dtype"):
+        import numpy as np
+
+        arr_a = np.ascontiguousarray(tokens_a[:limit], dtype=np.int32)
+        arr_b = np.ascontiguousarray(tokens_b[:limit], dtype=np.int32)
+        binding = get_binding()
+        if hasattr(binding.lib, "tiktalkin_find_common_prefix"):
+            ptr_a = arr_a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+            ptr_b = arr_b.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+            return int(
+                binding.lib.tiktalkin_find_common_prefix(
+                    ptr_a, limit, ptr_b, limit
+                )
+            )
+        mismatches = np.flatnonzero(arr_a != arr_b)
+        return int(mismatches[0]) if mismatches.size > 0 else limit
+
+    for i in range(limit):
+        if tokens_a[i] != tokens_b[i]:
+            return i
+    return limit
+
+
 class Encoding:
     def __init__(
         self,
@@ -232,7 +301,9 @@ class Encoding:
                 else:
                     tik_candidate = p / "qwen.tiktoken"
                     if tik_candidate.exists():
-                        resolved_ranks = compile_qwen_ranks_binary(tik_candidate, bin_candidate)
+                        resolved_ranks = compile_qwen_ranks_binary(
+                            tik_candidate, bin_candidate
+                        )
 
         if resolved_ranks is None or not resolved_ranks.exists():
             search_candidates = [
@@ -254,22 +325,39 @@ class Encoding:
             )
 
         self._ranks_path = resolved_ranks
-        self._ctx = self._binding.lib.tiktalkin_init(str(self._ranks_path).encode("utf-8"))
+        self._ctx = self._binding.lib.tiktalkin_init(
+            str(self._ranks_path).encode("utf-8")
+        )
         if not self._ctx:
-            raise RuntimeError(f"Failed to initialize TikTalkin context from {self._ranks_path}")
+            raise RuntimeError(
+                f"Failed to initialize TikTalkin context from {self._ranks_path}"
+            )
 
         self._n_vocab = 184704
         self._eot_token = 151643
-        self._special_tokens_set = {
-            "<|endoftext|>", "<|im_start|>", "<|im_end|>", "<R>", "<S>", "<X>", "<mask|>", "<sep>",
-            "<abc>", "</abc>", "<extra_198>", "<extra_199>",
-            *(f"<extra_{i}>" for i in range(196)),
+
+        defaults = build_default_yue2_specials()
+        self._special_token_to_id: Dict[str, int] = {
+            literal: s_id for literal, s_id in defaults
+        }
+        self._special_tokens_set: Set[str] = set(self._special_token_to_id.keys())
+        self._id_to_special_token: Dict[int, str] = {
+            s_id: literal for literal, s_id in defaults
         }
 
-    def __del__(self):
+    def close(self) -> None:
         if hasattr(self, "_ctx") and self._ctx:
             self._binding.lib.tiktalkin_destroy(self._ctx)
             self._ctx = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def __enter__(self) -> Encoding:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
 
     @property
     def name(self) -> str:
@@ -287,9 +375,15 @@ class Encoding:
     def special_tokens_set(self) -> Set[str]:
         return self._special_tokens_set
 
+    @property
+    def special_token_to_id(self) -> Dict[str, int]:
+        return self._special_token_to_id
+
     def encode_ordinary(self, text: str) -> List[int]:
         if not text:
             return []
+        if not self._ctx:
+            raise RuntimeError("Operation attempted on closed TikTalkin context.")
         raw = text.encode("utf-8")
         byte_len = len(raw)
         max_tokens = max(byte_len, 16)
@@ -298,7 +392,7 @@ class Encoding:
         count = self._binding.lib.tiktalkin_encode_ordinary(
             self._ctx, raw, byte_len, out_buf, max_tokens
         )
-        return out_buf[:count]
+        return list(out_buf[:count])
 
     def encode(
         self,
@@ -309,24 +403,37 @@ class Encoding:
     ) -> List[int]:
         if not text:
             return []
+        if not self._ctx:
+            raise RuntimeError("Operation attempted on closed TikTalkin context.")
 
         if disallowed_special == "all":
-            disallowed = self._special_tokens_set - (self._special_tokens_set if allowed_special == "all" else set(allowed_special))
+            allowed_reference = (
+                self._special_tokens_set
+                if allowed_special == "all"
+                else set(allowed_special)
+            )
+            disallowed = self._special_tokens_set - allowed_reference
             for special in disallowed:
                 if special in text:
-                    raise ValueError(f"Encountered text corresponding to disallowed special token {special!r}.")
+                    raise ValueError(
+                        f"Encountered text corresponding to disallowed special token {special!r}."
+                    )
         elif disallowed_special:
             for special in disallowed_special:
                 if special in text:
-                    raise ValueError(f"Encountered text corresponding to disallowed special token {special!r}.")
+                    raise ValueError(
+                        f"Encountered text corresponding to disallowed special token {special!r}."
+                    )
 
         if allowed_special == "all":
             raw = text.encode("utf-8")
             byte_len = len(raw)
             max_tokens = max(byte_len, 16)
             out_buf = (ctypes.c_int32 * max_tokens)()
-            count = self._binding.lib.tiktalkin_encode(self._ctx, raw, byte_len, out_buf, max_tokens)
-            return out_buf[:count]
+            count = self._binding.lib.tiktalkin_encode(
+                self._ctx, raw, byte_len, out_buf, max_tokens
+            )
+            return list(out_buf[:count])
 
         if not allowed_special:
             return self.encode_ordinary(text)
@@ -337,10 +444,29 @@ class Encoding:
             byte_len = len(raw)
             max_tokens = max(byte_len, 16)
             out_buf = (ctypes.c_int32 * max_tokens)()
-            count = self._binding.lib.tiktalkin_encode(self._ctx, raw, byte_len, out_buf, max_tokens)
-            return out_buf[:count]
+            count = self._binding.lib.tiktalkin_encode(
+                self._ctx, raw, byte_len, out_buf, max_tokens
+            )
+            return list(out_buf[:count])
 
-        return self.encode_ordinary(text)
+        valid_allowed = [s for s in allowed_set if s in self._special_tokens_set]
+        if not valid_allowed:
+            return self.encode_ordinary(text)
+
+        valid_allowed_set = set(valid_allowed)
+        valid_allowed.sort(key=len, reverse=True)
+        pattern = f"({'|'.join(re.escape(s) for s in valid_allowed)})"
+        parts = re.split(pattern, text)
+
+        result: List[int] = []
+        for part in parts:
+            if not part:
+                continue
+            if part in valid_allowed_set:
+                result.append(self._special_token_to_id[part])
+            else:
+                result.extend(self.encode_ordinary(part))
+        return result
 
     def encode_batch(
         self,
@@ -352,12 +478,27 @@ class Encoding:
     ) -> List[List[int]]:
         text_list = list(texts)
         if len(text_list) <= 1 or num_threads <= 1:
-            return [self.encode(t, allowed_special=allowed_special, disallowed_special=disallowed_special) for t in text_list]
-        with ThreadPoolExecutor(max_workers=min(num_threads, len(text_list))) as executor:
-            return list(executor.map(
-                lambda t: self.encode(t, allowed_special=allowed_special, disallowed_special=disallowed_special),
-                text_list,
-            ))
+            return [
+                self.encode(
+                    t,
+                    allowed_special=allowed_special,
+                    disallowed_special=disallowed_special,
+                )
+                for t in text_list
+            ]
+        with ThreadPoolExecutor(
+            max_workers=min(num_threads, len(text_list))
+        ) as executor:
+            return list(
+                executor.map(
+                    lambda t: self.encode(
+                        t,
+                        allowed_special=allowed_special,
+                        disallowed_special=disallowed_special,
+                    ),
+                    text_list,
+                )
+            )
 
     def encode_ordinary_batch(
         self,
@@ -368,15 +509,26 @@ class Encoding:
         text_list = list(texts)
         if len(text_list) <= 1 or num_threads <= 1:
             return [self.encode_ordinary(t) for t in text_list]
-        with ThreadPoolExecutor(max_workers=min(num_threads, len(text_list))) as executor:
+        with ThreadPoolExecutor(
+            max_workers=min(num_threads, len(text_list))
+        ) as executor:
             return list(executor.map(self.encode_ordinary, text_list))
 
     def decode(self, tokens: Sequence[int], errors: str = "replace") -> str:
         if not tokens:
             return ""
+        if not self._ctx:
+            raise RuntimeError("Operation attempted on closed TikTalkin context.")
         count = len(tokens)
-        arr_type = ctypes.c_int32 * count
-        c_tokens = arr_type(*tokens)
+
+        if hasattr(tokens, "dtype") and str(tokens.dtype) == "int32":
+            import numpy as np
+
+            contiguous_arr = np.ascontiguousarray(tokens, dtype=np.int32)
+            c_tokens = contiguous_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+        else:
+            arr_type = ctypes.c_int32 * count
+            c_tokens = arr_type(*tokens)
 
         alloc_size = max(count * 8 + 64, 1024)
         buf = ctypes.create_string_buffer(alloc_size)
@@ -402,11 +554,17 @@ class Encoding:
         batch_list = list(batch)
         if len(batch_list) <= 1 or num_threads <= 1:
             return [self.decode(toks, errors=errors) for toks in batch_list]
-        with ThreadPoolExecutor(max_workers=min(num_threads, len(batch_list))) as executor:
-            return list(executor.map(lambda toks: self.decode(toks, errors=errors), batch_list))
+        with ThreadPoolExecutor(
+            max_workers=min(num_threads, len(batch_list))
+        ) as executor:
+            return list(
+                executor.map(lambda toks: self.decode(toks, errors=errors), batch_list)
+            )
 
 
-def get_encoding(encoding_name: str = "YuE2", ranks_path: Optional[Union[str, Path]] = None) -> Encoding:
+def get_encoding(
+    encoding_name: str = "YuE2", ranks_path: Optional[Union[str, Path]] = None
+) -> Encoding:
     return Encoding(name=encoding_name, ranks_path=ranks_path)
 
 
