@@ -8,6 +8,7 @@ import re
 import sys
 from typing import (
     AbstractSet,
+    Any,
     Collection,
     Dict,
     Iterable,
@@ -120,6 +121,11 @@ def _locate_native_library() -> Path:
         ROOT_DIR / _DLL_NAME,
         ROOT_DIR / "dist" / "bin" / _DLL_NAME,
         ROOT_DIR / "build" / _DLL_NAME,
+        ROOT_DIR.parent / "dist" / "bin" / _DLL_NAME,
+        ROOT_DIR.parent / "tiktalkin" / _DLL_NAME,
+        ROOT_DIR.parent / "tiktalkin" / "dist" / "bin" / _DLL_NAME,
+        ROOT_DIR.parent / "doodle" / "tiktalkin" / _DLL_NAME,
+        ROOT_DIR.parent / "doodle" / "tiktalkin" / "dist" / "bin" / _DLL_NAME,
     ]
     env_override = os.environ.get("TIKTALKIN_DLL_PATH")
     if env_override:
@@ -242,31 +248,41 @@ def compile_qwen_ranks_binary(
 
 
 def find_common_prefix(
-    tokens_a: Sequence[int],
-    tokens_b: Sequence[int],
+    tokens_a: Union[Sequence[int], Any],
+    tokens_b: Union[Sequence[int], Any],
 ) -> int:
+    if hasattr(tokens_a, "detach"):
+        tokens_a = tokens_a.detach().cpu().numpy().ravel()
+    if hasattr(tokens_b, "detach"):
+        tokens_b = tokens_b.detach().cpu().numpy().ravel()
+
     len_a = len(tokens_a)
     len_b = len(tokens_b)
     limit = len_a if len_a < len_b else len_b
     if limit == 0:
         return 0
 
-    if hasattr(tokens_a, "dtype") and hasattr(tokens_b, "dtype"):
+    try:
         import numpy as np
 
-        arr_a = np.ascontiguousarray(tokens_a[:limit], dtype=np.int32)
-        arr_b = np.ascontiguousarray(tokens_b[:limit], dtype=np.int32)
-        binding = get_binding()
-        if hasattr(binding.lib, "tiktalkin_find_common_prefix"):
-            ptr_a = arr_a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-            ptr_b = arr_b.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-            return int(
-                binding.lib.tiktalkin_find_common_prefix(
-                    ptr_a, limit, ptr_b, limit
+        is_arr_a = isinstance(tokens_a, np.ndarray)
+        is_arr_b = isinstance(tokens_b, np.ndarray)
+        if is_arr_a or is_arr_b or limit > 32:
+            arr_a = np.ascontiguousarray(tokens_a[:limit], dtype=np.int32)
+            arr_b = np.ascontiguousarray(tokens_b[:limit], dtype=np.int32)
+            binding = get_binding()
+            if hasattr(binding.lib, "tiktalkin_find_common_prefix"):
+                ptr_a = arr_a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+                ptr_b = arr_b.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+                return int(
+                    binding.lib.tiktalkin_find_common_prefix(
+                        ptr_a, limit, ptr_b, limit
+                    )
                 )
-            )
-        mismatches = np.flatnonzero(arr_a != arr_b)
-        return int(mismatches[0]) if mismatches.size > 0 else limit
+            mismatches = np.flatnonzero(arr_a != arr_b)
+            return int(mismatches[0]) if mismatches.size > 0 else limit
+    except Exception:
+        pass
 
     for i in range(limit):
         if tokens_a[i] != tokens_b[i]:
@@ -309,6 +325,12 @@ class Encoding:
             search_candidates = [
                 ROOT_DIR / "qwen.ranks.bin",
                 ROOT_DIR / "dist" / "bin" / "qwen.ranks.bin",
+                ROOT_DIR.parent / "qwen.ranks.bin",
+                ROOT_DIR.parent / "dist" / "bin" / "qwen.ranks.bin",
+                ROOT_DIR.parent / "tiktalkin" / "qwen.ranks.bin",
+                ROOT_DIR.parent / "tiktalkin" / "dist" / "bin" / "qwen.ranks.bin",
+                ROOT_DIR.parent / "doodle" / "tiktalkin" / "qwen.ranks.bin",
+                ROOT_DIR.parent / "doodle" / "tiktalkin" / "dist" / "bin" / "qwen.ranks.bin",
             ]
             env_ranks = os.environ.get("TIKTALKIN_RANKS_PATH")
             if env_ranks:
@@ -514,19 +536,26 @@ class Encoding:
         ) as executor:
             return list(executor.map(self.encode_ordinary, text_list))
 
-    def decode(self, tokens: Sequence[int], errors: str = "replace") -> str:
-        if not tokens:
+    def decode(self, tokens: Union[Sequence[int], Any], errors: str = "replace") -> str:
+        if hasattr(tokens, "detach"):
+            tokens = tokens.detach().cpu().numpy().ravel()
+        if hasattr(tokens, "__len__") and len(tokens) == 0:
             return ""
         if not self._ctx:
             raise RuntimeError("Operation attempted on closed TikTalkin context.")
-        count = len(tokens)
 
-        if hasattr(tokens, "dtype") and str(tokens.dtype) == "int32":
+        try:
             import numpy as np
 
-            contiguous_arr = np.ascontiguousarray(tokens, dtype=np.int32)
+            contiguous_arr = np.ascontiguousarray(tokens, dtype=np.int32).ravel()
+            count = int(contiguous_arr.size)
+            if count == 0:
+                return ""
             c_tokens = contiguous_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-        else:
+        except Exception:
+            count = len(tokens)
+            if count == 0:
+                return ""
             arr_type = ctypes.c_int32 * count
             c_tokens = arr_type(*tokens)
 
@@ -546,7 +575,7 @@ class Encoding:
 
     def decode_batch(
         self,
-        batch: Iterable[Sequence[int]],
+        batch: Iterable[Union[Sequence[int], Any]],
         *,
         num_threads: int = 8,
         errors: str = "replace",
