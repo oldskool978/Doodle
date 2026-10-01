@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Optional, Sequence, Set, Union
 import unicodedata
@@ -19,7 +20,11 @@ def compile_qwen_ranks_binary(model_dir: Path) -> Path:
         return bin_path
     tiktoken_path = model_dir / "qwen.tiktoken"
     if not tiktoken_path.exists():
-        raise FileNotFoundError(f"Missing upstream vocabulary file: {tiktoken_path}")
+        matches = list(model_dir.rglob("*.tiktoken"))
+        if matches:
+            tiktoken_path = matches[0]
+        else:
+            raise FileNotFoundError(f"Missing upstream vocabulary file: {tiktoken_path}")
     return _native_compile(tiktoken_path, bin_path)
 
 
@@ -37,12 +42,12 @@ class YuE2Tokenizer:
                 resolved_bin = source_path
             elif source_path.is_file() and source_path.suffix == ".tiktoken":
                 cand = source_path.with_suffix(".ranks.bin")
-                if not cand.exists():
+                if not cand.exists() or cand.stat().st_size < 1024 * 1024:
                     _native_compile(source_path, cand)
                 resolved_bin = cand
             elif source_path.is_dir():
                 cand = source_path / "qwen.ranks.bin"
-                if cand.exists():
+                if cand.exists() and cand.stat().st_size > 1024 * 1024:
                     resolved_bin = cand
                 else:
                     tik_cand = source_path / "qwen.tiktoken"
@@ -50,9 +55,37 @@ class YuE2Tokenizer:
                         resolved_bin = _native_compile(tik_cand, cand)
 
         if resolved_bin is None or not resolved_bin.exists():
-            default_local = Path(__file__).resolve().parent.parent / "tiktalkin" / "qwen.ranks.bin"
-            if default_local.exists():
-                resolved_bin = default_local
+            search_candidates = [
+                Path(__file__).resolve().parent.parent / "tiktalkin" / "qwen.ranks.bin",
+                Path(__file__).resolve().parent.parent.parent / "tiktalkin" / "dist" / "bin" / "qwen.ranks.bin",
+                Path(__file__).resolve().parent.parent.parent / "tiktalkin" / "qwen.ranks.bin",
+                Path(__file__).resolve().parent.parent.parent / "songstress" / "tiktalkin" / "qwen.ranks.bin",
+                Path(__file__).resolve().parent.parent.parent / "dist" / "bin" / "qwen.ranks.bin",
+            ]
+            env_ranks = os.environ.get("TIKTALKIN_RANKS_PATH")
+            if env_ranks:
+                search_candidates.insert(0, Path(env_ranks).resolve())
+
+            for cand in search_candidates:
+                if cand.is_file() and cand.stat().st_size > 1024 * 1024:
+                    resolved_bin = cand
+                    break
+
+        if resolved_bin is None or not resolved_bin.exists():
+            search_tiktoks = [
+                Path(__file__).resolve().parent.parent / "qwen.tiktoken",
+                Path(__file__).resolve().parent.parent.parent / "qwen.tiktoken",
+                Path(__file__).resolve().parent.parent.parent / "tiktalkin" / "qwen.tiktoken",
+            ]
+            for tik in search_tiktoks:
+                if tik.is_file() and tik.stat().st_size > 1024 * 1024:
+                    target_bin = tik.with_suffix(".ranks.bin")
+                    _native_compile(tik, target_bin)
+                    resolved_bin = target_bin
+                    break
+
+        if resolved_bin is None or not resolved_bin.exists():
+            raise FileNotFoundError("Unable to resolve valid qwen.ranks.bin container.")
 
         self._enc = Encoding("YuE2", ranks_path=resolved_bin)
         self.n_vocab = self._enc.n_vocab

@@ -18,14 +18,13 @@ sys.modules["torchvision"] = None
 sys.modules["torchvision.transforms"] = None
 sys.modules["torchvision.io"] = None
 
-CACHE_DIR = ROOT_DIR / ".hf_cache"
+CACHE_DIR = Path(os.environ.get("HF_HOME") or (ROOT_DIR / ".hf_cache")).resolve()
 os.environ["HF_HOME"] = str(CACHE_DIR)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors, save_file as save_safetensors
-
 from models.tokenizer import compile_qwen_ranks_binary
 from engine import MusicEngine
 
@@ -43,7 +42,6 @@ logging.basicConfig(
 
 DEFAULT_REPO_ID = "m-a-p/YuE2-3B"
 DEFAULT_VAE_REPO_ID = "m-a-p/YuE2-Vae"
-
 PRECISION_CHOICES = ["native", "bf16", "fp16", "e4m3fn", "e5m2"]
 QUANT_ENGINES = ["clean_rtn", "dto_ca"]
 
@@ -64,7 +62,6 @@ DTYPE_LOOKUP = {
     "e5m2": getattr(torch, "float8_e5m2", None),
     "e8m0fnu": getattr(torch, "float8_e8m0fnu", None),
 }
-
 FP8_DTYPES = [v for k, v in DTYPE_LOOKUP.items() if "e" in k and v is not None]
 
 IGNORE_DOWNLOAD_PATTERNS = [
@@ -220,7 +217,6 @@ def condition_model_shards(
             else:
                 processed_dict[key] = tensor
                 preserved_tensors_count += 1
-
         save_safetensors(processed_dict, str(sf_path))
         del state_dict, processed_dict
         processed_count += 1
@@ -230,7 +226,6 @@ def condition_model_shards(
         torch.cuda.synchronize()
     if HAS_REFINERY:
         clear_refinery_cache()
-
     logging.info(
         "Conditioning Complete: %d quantized (%s), %d preserved native, %d dead keys removed.",
         quantized_tensors_count,
@@ -261,7 +256,7 @@ def download_and_condition_weights(
         local_dir_use_symlinks=False,
         ignore_patterns=IGNORE_DOWNLOAD_PATTERNS,
     )
-    backbone_path = Path(snapshot_path_str)
+    backbone_path = Path(snapshot_path_str).resolve()
 
     logging.info("Initiating VAE acquisition for: %s", vae_repo_id)
     vae_snapshot_path_str = snapshot_download(
@@ -272,11 +267,10 @@ def download_and_condition_weights(
         local_dir_use_symlinks=False,
         ignore_patterns=IGNORE_DOWNLOAD_PATTERNS,
     )
-    vae_path = Path(vae_snapshot_path_str)
+    vae_path = Path(vae_snapshot_path_str).resolve()
 
     verify_upstream_manifest(backbone_path)
 
-    # Compile sovereign binary rank cache during hydration
     logging.info("Auditing sovereign tokenization binary cache...")
     ranks_bin = compile_qwen_ranks_binary(backbone_path)
     logging.info("Binary ranks cache confirmed: %s (%d bytes)", ranks_bin.name, ranks_bin.stat().st_size)
@@ -295,8 +289,8 @@ def download_and_condition_weights(
         logging.info("=" * 80)
         t0 = time.perf_counter()
         engine = MusicEngine(
-            repo_id=repo_id,
-            vae_repo_id=vae_repo_id,
+            repo_id=str(backbone_path),
+            vae_repo_id=str(vae_path),
             device=compute_device,
             dtype=target_dtype if target_dtype is not None else torch.bfloat16,
         )
@@ -335,7 +329,6 @@ def prompt_precision_menu() -> Tuple[str, str, str]:
     precision = mapping.get(choice.lower(), "native")
     if precision == "native":
         return "native", "clean_rtn", "auto"
-
     quant_engine = "clean_rtn"
     if HAS_REFINERY:
         print("\n" + "-" * 80)
@@ -358,34 +351,13 @@ def prompt_precision_menu() -> Tuple[str, str, str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Acquire, condition, and verify YuE2 model weights.")
-    parser.add_argument("--repo_id", type=str, default=DEFAULT_REPO_ID, help="Hugging Face backbone repository ID.")
-    parser.add_argument("--vae_repo_id", type=str, default=DEFAULT_VAE_REPO_ID, help="Hugging Face VAE repository ID.")
-    parser.add_argument(
-        "--precision",
-        "--quant_target",
-        dest="precision",
-        type=str,
-        choices=PRECISION_CHOICES,
-        default=None,
-        help="Target precision for quantizable linear blocks.",
-    )
-    parser.add_argument(
-        "--engine",
-        dest="quant_engine",
-        type=str,
-        choices=QUANT_ENGINES,
-        default="clean_rtn",
-        help="Quantization engine backend (clean_rtn / dto_ca).",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        choices=["auto", "cuda", "cpu"],
-        default=None,
-        help="Compute execution provider for conditioning pass.",
-    )
-    parser.add_argument("--max_workers", type=int, default=8, help="Concurrent download worker threads.")
-    parser.add_argument("--skip_warmup", action="store_true", help="Skip forward pass execution warmup.")
+    parser.add_argument("--repo_id", type=str, default=DEFAULT_REPO_ID)
+    parser.add_argument("--vae_repo_id", type=str, default=DEFAULT_VAE_REPO_ID)
+    parser.add_argument("--precision", "--quant_target", dest="precision", type=str, choices=PRECISION_CHOICES, default=None)
+    parser.add_argument("--engine", dest="quant_engine", type=str, choices=QUANT_ENGINES, default="clean_rtn")
+    parser.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default=None)
+    parser.add_argument("--max_workers", type=int, default=8)
+    parser.add_argument("--skip_warmup", action="store_true")
     args = parser.parse_args()
 
     precision = args.precision

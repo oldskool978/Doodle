@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -91,7 +91,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     if "engine_defaults" in data and isinstance(data["engine_defaults"], dict):
         data = data["engine_defaults"]
     harvested: Dict[str, Any] = {}
-
     if "cot" in data and isinstance(data["cot"], str):
         c = data["cot"].strip().lower()
         if c in SUPPORTED_COT:
@@ -209,15 +208,15 @@ class GenerationRequest(BaseModel):
     vocals: str = Field(default="", max_length=800)
     vocal_lead: Optional[str] = Field(default="", max_length=800)
     instrumental_lead: Optional[str] = Field(default="", max_length=800)
-    arrangement: str = Field(default="", max_length=2000)
-    lyrics: str = Field(default="", max_length=6000)
-    instrumental_lyrics: str = Field(default="", max_length=6000)
+    arrangement: str = Field(default="", max_length=8000)
+    lyrics: str = Field(default="", max_length=32768)
+    instrumental_lyrics: str = Field(default="", max_length=32768)
     is_instrumental: bool = Field(default=False)
     instrumental_branch: str = Field(default="cues")
-    raw_prompt: Optional[str] = Field(default=None, max_length=5000)
-    prompt: Optional[str] = Field(default=None, max_length=5000)
+    raw_prompt: Optional[str] = Field(default=None, max_length=16384)
+    prompt: Optional[str] = Field(default=None, max_length=16384)
     cot: Optional[str] = Field(default=None)
-    abc: Optional[str] = Field(default=None, max_length=8000)
+    abc: Optional[str] = Field(default=None, max_length=65536)
     temperature: Optional[float] = Field(default=None, ge=0.0001, le=5.0)
     top_p: Optional[float] = Field(default=None, ge=0.0001, le=1.0)
     top_k: Optional[int] = Field(default=None, ge=1, le=500)
@@ -320,7 +319,6 @@ class GenerationRequest(BaseModel):
             self.repetition_penalty = float(active["repetition_penalty"])
         if self.penalty_window is None or (use_custom and self.penalty_window == BASELINE_ENGINE_DEFAULTS["penalty_window"]):
             self.penalty_window = int(active["penalty_window"])
-
         if self.abc_temperature is None or (use_custom and self.abc_temperature == BASELINE_ENGINE_DEFAULTS["abc_temperature"]):
             self.abc_temperature = float(active["abc_temperature"])
         if self.abc_top_p is None or (use_custom and self.abc_top_p == BASELINE_ENGINE_DEFAULTS["abc_top_p"]):
@@ -331,7 +329,6 @@ class GenerationRequest(BaseModel):
             self.abc_repetition_penalty = float(active["abc_repetition_penalty"])
         if self.abc_penalty_window is None or (use_custom and self.abc_penalty_window == BASELINE_ENGINE_DEFAULTS["abc_penalty_window"]):
             self.abc_penalty_window = int(active["abc_penalty_window"])
-
         if self.cfg_scale is None or (use_custom and self.cfg_scale == BASELINE_ENGINE_DEFAULTS["cfg_scale"]):
             self.cfg_scale = float(active["cfg_scale"])
         if self.num_inference_steps is None or (use_custom and self.num_inference_steps == BASELINE_ENGINE_DEFAULTS["num_inference_steps"]):
@@ -363,18 +360,17 @@ class GenerationRequest(BaseModel):
                     self.vocals = ""
             elif not self.vocals and self.instrumental_lead:
                 self.vocals = self.instrumental_lead
+
         return self
 
     def compile_style(self) -> str:
         override = self.raw_prompt or self.prompt
         if override and override.strip():
             return clean_caption(override.strip())
-
         parts: List[str] = []
         genre_desc = " / ".join(filter(None, [self.genre.strip(), self.subgenre.strip()]))
         if genre_desc:
             parts.append(genre_desc)
-
         if self.bpm and self.bpm > 0:
             parts.append(f"{self.bpm} bpm")
 
@@ -392,11 +388,9 @@ class GenerationRequest(BaseModel):
 
         if self.mood and self.mood.strip():
             parts.append(self.mood.strip().rstrip("."))
-
         lead_desc = (self.instrumental_lead if self.is_instrumental else self.vocal_lead) or self.vocals
         if lead_desc and lead_desc.strip():
             parts.append(lead_desc.strip().rstrip("."))
-
         if self.arrangement and self.arrangement.strip():
             parts.append(self.arrangement.strip().rstrip("."))
 
@@ -442,13 +436,11 @@ class GenerationRequest(BaseModel):
                             compiled.append(trimmed if trimmed.startswith("(") and trimmed.endswith(")") else f"({trimmed})")
                     return normalize_lyrics("\n".join(compiled))
                 return normalize_lyrics("[intro]\n\n[theme a]\n\n[verse]\n\n[chorus]\n\n[solo]\n\n[breakdown]\n\n[outro]")
-
             elif branch == "tags_only":
                 active_blocks = self.instrumental_blocks or self.blocks
                 if active_blocks:
                     tags = [f"[{re.sub(r'[\[\]]', '', str(b.get('label') or b.get('type') or 'verse')).strip().lower()}]" for b in active_blocks if isinstance(b, dict)]
                     return normalize_lyrics("\n\n".join(tags))
-
                 active_raw = self.instrumental_lyrics if self.instrumental_lyrics.strip() else self.lyrics
                 if active_raw and active_raw.strip():
                     tags = [m.group(0).lower() for m in re.finditer(r"\[([^\]]+)\]", active_raw)]

@@ -4,21 +4,21 @@ import gc
 import json
 import math
 import os
+from pathlib import Path
 import random
 import shutil
 import sys
 import time
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 import unicodedata
 import warnings
-from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-CACHE_DIR = ROOT_DIR / ".hf_cache"
-TMP_DIR = ROOT_DIR / "artifacts" / "tmp"
+CACHE_DIR = Path(os.environ.get("HF_HOME") or (ROOT_DIR / ".hf_cache")).resolve()
+TMP_DIR = Path(os.environ.get("TMP") or (ROOT_DIR / "artifacts" / "tmp")).resolve()
 for d in [CACHE_DIR, TMP_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -76,17 +76,51 @@ def apply_sub_millisecond_declick(audio_tensor: torch.Tensor, fade_samples: int 
     return audio_tensor
 
 
-def resolve_model_path(repo_or_path: str) -> Path:
-    direct_path = Path(repo_or_path)
-    if direct_path.exists():
+def resolve_model_path(repo_or_path: Union[str, Path]) -> Path:
+    direct_path = Path(repo_or_path).resolve()
+    if direct_path.exists() and (direct_path.is_dir() or direct_path.is_file()):
         return direct_path
-    hub_path = CACHE_DIR / "hub"
-    repo_folder_name = "models--" + repo_or_path.replace("/", "--")
-    candidate = hub_path / repo_folder_name / "snapshots"
-    if candidate.exists():
-        snapshots = list(candidate.iterdir())
-        if snapshots:
-            return snapshots[0]
+
+    repo_str = str(repo_or_path).replace("\\", "/")
+    hub_candidates: List[Path] = []
+
+    if "HUGGINGFACE_HUB_CACHE" in os.environ:
+        hub_candidates.append(Path(os.environ["HUGGINGFACE_HUB_CACHE"]).resolve())
+    if "HF_HOME" in os.environ:
+        hf_home = Path(os.environ["HF_HOME"]).resolve()
+        hub_candidates.append(hf_home / "hub")
+        hub_candidates.append(hf_home)
+    hub_candidates.append(CACHE_DIR / "hub")
+    hub_candidates.append(CACHE_DIR)
+    hub_candidates.append(ROOT_DIR.parent / ".hf_cache" / "hub")
+    hub_candidates.append(ROOT_DIR.parent / ".hf_cache")
+    hub_candidates.append(Path.home() / ".cache" / "huggingface" / "hub")
+
+    repo_folder_name = "models--" + repo_str.replace("/", "--")
+    pure_name = repo_str.split("/")[-1]
+
+    for hub_dir in hub_candidates:
+        if not hub_dir.exists():
+            continue
+        cand = hub_dir / repo_folder_name / "snapshots"
+        if cand.exists():
+            snapshots = sorted(list(cand.iterdir()), key=lambda p: p.stat().st_mtime, reverse=True)
+            if snapshots:
+                return snapshots[0].resolve()
+        direct_named = hub_dir / pure_name
+        if direct_named.exists() and (direct_named / "config.json").exists():
+            return direct_named.resolve()
+
+    for hub_dir in hub_candidates:
+        if not hub_dir.exists():
+            continue
+        try:
+            matches = list(hub_dir.rglob(f"{pure_name}/config.json"))
+            if matches:
+                return matches[0].parent.resolve()
+        except Exception:
+            pass
+
     return direct_path
 
 
@@ -128,16 +162,22 @@ def sample_categorical_distribution(
         allowed[..., CODEC_OFFSET : CODEC_OFFSET + CODEC_SIZE] = 0.0
     allowed[..., end_token] = 0.0
     scores = scores + allowed
+
     if step < min_tokens:
         scores[..., end_token] = -float("inf")
+
     scores = apply_windowed_penalty(scores, history, penalty, penalty_window)
+
     if temperature <= 0.0:
         return int(scores.argmax(-1).item())
+
     if temperature != 1.0:
         scores = scores / temperature
+
     k_val = min(top_k, scores.shape[-1])
     threshold = scores.topk(k_val, dim=-1).values[..., -1, None]
     scores = scores.masked_fill(scores < threshold, -float("inf"))
+
     if top_p < 1.0:
         sorted_vals, sorted_indices = scores.sort(descending=True, dim=-1)
         probs = sorted_vals.softmax(dim=-1)
@@ -146,6 +186,7 @@ def sample_categorical_distribution(
         exceeded[..., 0] = False
         sorted_vals = sorted_vals.masked_fill(exceeded, -float("inf"))
         scores = scores.scatter(-1, sorted_indices, sorted_vals)
+
     probabilities = scores.softmax(dim=-1)
     next_id = torch.multinomial(probabilities, 1, generator=generator)
     return int(next_id.item())
@@ -198,10 +239,8 @@ class EngineProgressReporter:
         if not is_final and (now - self.last_render < self.render_interval):
             return
         self.last_render = now
-
         elapsed = max(now - self.stage_start, 1e-4)
         pct = (current / max(total, 1)) * 100.0
-
         rate = (current / elapsed) if (elapsed >= 0.25 and current >= 3) else 0.0
         remaining_units = max(0, total - current)
         eta = (remaining_units / rate) if rate > 0.0 else 0.0
@@ -233,8 +272,8 @@ class EngineProgressReporter:
         avail = cols - len(prefix) - len(suffix) - 3
         bar_len = max(8, min(avail, 30))
         filled = min(bar_len, int(bar_len * current / max(total, 1)))
-        bar = "━" * filled + "╸" if (filled < bar_len and current > 0) else "━" * filled
-        bar = bar.ljust(bar_len, "─")
+        bar = "=" * filled + ">" if (filled < bar_len and current > 0) else "=" * filled
+        bar = bar.ljust(bar_len, " ")
 
         line = f"\r{prefix} [{bar}]{suffix}"
         sys.stdout.write(line.ljust(cols - 1)[: cols - 1])
@@ -272,6 +311,7 @@ class CachedNARChunkSolver:
         self.dtype = next(model.parameters()).dtype
         self.ar_length = len(chunk_tokens)
         self.nar_length = len(initial_noise) + 2
+
         pos = torch.arange(self.ar_length, self.ar_length + self.nar_length, device=self.device)[None]
         self.cos, self.sin = model.model.rotary_emb(pos)
         local_ids = torch.arange(self.nar_length, device=self.device).clamp(max=model.config.max_latent_frames - 1)
@@ -286,6 +326,7 @@ class CachedNARChunkSolver:
         positions = torch.arange(self.ar_length, device=self.device)[None]
         cos, sin = backbone.rotary_emb(positions)
         x = backbone.embed_tokens(tokens_tensor)
+
         for layer in backbone.layers:
             q, k, v = layer.self_attn.project_qkv(layer.input_layernorm(x), cos, sin)
             self.kv_cache.append((k[0].clone(), v[0].clone()))
@@ -309,6 +350,7 @@ class CachedNARChunkSolver:
         x = self.model.vae2llm(x_nar[None])
         x = x + self.model.time_embedder(t_shifted.expand(self.nar_length))[None]
         x = x + self.pos_emb
+
         for layer, (ar_k, ar_v) in zip(self.model.model.layers, self.kv_cache):
             q, k, v = layer.nar_self_attn.project_qkv(layer.nar_input_layernorm(x), self.cos, self.sin)
             k_comb = torch.cat((ar_k, k[0]), dim=0)
@@ -325,6 +367,7 @@ class CachedNARChunkSolver:
             ).transpose(1, 2)
             x = x + layer.nar_self_attn.o_proj(h.reshape(1, self.nar_length, -1))
             x = x + layer.nar_mlp(layer.nar_pre_mlp_layernorm(x))
+
         return self.model.llm2vae(self.model.model.norm(x))[0, 1:-1]
 
     @torch.inference_mode()
@@ -355,8 +398,10 @@ class CachedNARChunkSolver:
                 raw_mid = torch.logit(torch.tensor(t - dt / 2.0, dtype=torch.float64, device="cpu")).clamp(-20.0, 20.0).item()
                 v2 = self.velocity(state_mid, raw_mid)
                 state = state - v2 * dt
+
             if step_callback is not None:
                 step_callback(step + 1, steps)
+
         result = state.float().cpu()
         if not torch.isfinite(result).all():
             raise FloatingPointError("NAR flow-matching integration yielded non-finite values.")
@@ -379,12 +424,15 @@ class MusicEngine:
         self.vae_repo_id = vae_repo_id or "m-a-p/YuE2-Vae"
         self.device = torch.device(device) if isinstance(device, str) else device
         self.dtype = dtype
+
         self.model_path = resolve_model_path(self.repo_id)
         self.vae_path = resolve_model_path(self.vae_repo_id)
+
         ranks_path = self.model_path / "qwen.ranks.bin"
         if not ranks_path.exists():
             ranks_path = self.model_path / "qwen.tiktoken"
         self.tokenizer = YuE2Tokenizer(ranks_path)
+
         self.model: Optional[YuE2ForCausalLM] = None
         self.vae: Optional[YuE2VAE] = None
         self._current_offload_state: Optional[bool] = None
@@ -392,8 +440,10 @@ class MusicEngine:
     def _init_components(self, cpu_offload: bool) -> None:
         if self.model is not None and self.vae is not None and self._current_offload_state == cpu_offload:
             return
+
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA execution requested but no compatible GPU detected.")
+
         if self.model is not None:
             del self.model, self.vae
             self.model = None
@@ -401,17 +451,26 @@ class MusicEngine:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
         cfg_file = self.model_path / "config.json"
+        if not cfg_file.exists():
+            resolved = resolve_model_path(self.model_path)
+            cfg_file = resolved / "config.json"
+            self.model_path = resolved
+
         with open(cfg_file, "r", encoding="utf-8") as f:
             cfg_dict = json.load(f)
         cfg = YuE2Config(**cfg_dict)
+
         model_device = torch.device("cpu") if cpu_offload else self.device
         self.model = YuE2ForCausalLM(cfg).to(device=model_device, dtype=self.dtype).eval()
+
         weights_file = self.model_path / "model.safetensors"
         state = load_safetensors(str(weights_file), device="cpu")
         self.model.load_state_dict(state, strict=False)
         del state
         self.model.to(device=model_device, dtype=self.dtype).eval()
+
         vae_device = torch.device("cpu") if cpu_offload else self.device
         self.vae = YuE2VAE.from_pretrained(self.vae_path, decoder_only=True, device=vae_device)
         self._current_offload_state = cpu_offload
@@ -435,6 +494,7 @@ class MusicEngine:
 
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(self.device)
+
         start_time = time.perf_counter()
         explicit_seed = request.seed if (request.seed is not None and request.seed >= 0) else random.randint(100000, 99999999)
         random.seed(explicit_seed)
@@ -446,16 +506,19 @@ class MusicEngine:
 
         cot_mode = request.cot or defaults["cot"]
         instruction = INSTRUCTIONS.get(cot_mode, INSTRUCTIONS["full"])
+
         full_text = request.compile_full_text()
         style_text = request.compile_style()
         lyrics_text = request.sanitize_lyrics()
 
         base_tokens = [EOD] + self.tokenizer.encode(full_text)
+
         if request.cpu_offload:
             self.model.to(self.device)
 
         abc_output_text: Optional[str] = None
         abc_ids: List[int] = []
+
         if cot_mode != "off":
             if request.abc is not None and request.abc.strip():
                 abc_output_text = request.abc.strip()
@@ -473,6 +536,7 @@ class MusicEngine:
                 )
                 pre_in = torch.tensor([abc_prefix], dtype=torch.long, device=self.device)
                 logits = self.model(input_ids=pre_in, past_key_values=cache, use_cache=True, logits_to_keep=1).logits[:, -1, :]
+
                 history: List[int] = []
                 for step in range(4096):
                     token = sample_categorical_distribution(
@@ -494,6 +558,7 @@ class MusicEngine:
                     effective_callback("abc", step + 1, 4096)
                     step_in = torch.tensor([[token]], dtype=torch.long, device=self.device)
                     logits = self.model(input_ids=step_in, past_key_values=cache, use_cache=True, logits_to_keep=1).logits[:, -1, :]
+
                 abc_ids = history
                 abc_output_text = self.tokenizer.decode(abc_ids)
                 del cache
@@ -505,6 +570,7 @@ class MusicEngine:
 
         resolved_cfg = request.cfg_scale if request.cfg_scale is not None else defaults["cfg_scale"]
         apply_cfg = abs(resolved_cfg - 1.0) > 1e-4
+
         max_semantic_tokens = min(int(request.audio_duration * 25.0), 9000)
 
         cache_pos = StaticKVCache(
@@ -521,12 +587,14 @@ class MusicEngine:
 
         cache_neg: Optional[StaticKVCache] = None
         logits_neg: Optional[torch.Tensor] = None
+
         if apply_cfg:
             neg_base = [EOD] + self.tokenizer.encode(instruction)
             if cot_mode == "off":
-                neg_prefix = neg_base + [MUSIC_START]
+                neg_prefix = neg_base + [ABC_START, ABC_END, MUSIC_START]
             else:
                 neg_prefix = neg_base + [ABC_START] + abc_ids + [ABC_END, MUSIC_START]
+
             cache_neg = StaticKVCache(
                 num_layers=self.model.config.num_hidden_layers,
                 batch_size=1,
@@ -545,6 +613,7 @@ class MusicEngine:
                 effective_logits = logits_neg + resolved_cfg * (logits_pos - logits_neg)
             else:
                 effective_logits = logits_pos
+
             token = sample_categorical_distribution(
                 logits=effective_logits,
                 temperature=request.temperature if request.temperature is not None else defaults["temperature"],
@@ -558,14 +627,18 @@ class MusicEngine:
                 phase="semantic",
                 generator=generator,
             )
+
             if token == MUSIC_END:
                 break
+
             semantic_tokens.append(token)
             effective_callback("semantic", step + 1, max_semantic_tokens)
+
             step_in = torch.tensor([[token]], dtype=torch.long, device=self.device)
             logits_pos = self.model(input_ids=step_in, past_key_values=cache_pos, use_cache=True, logits_to_keep=1).logits[:, -1, :]
             if apply_cfg and cache_neg is not None:
                 logits_neg = self.model(input_ids=step_in, past_key_values=cache_neg, use_cache=True, logits_to_keep=1).logits[:, -1, :]
+
         del cache_pos, cache_neg
 
         raw_codec = [t - CODEC_OFFSET for t in semantic_tokens]
@@ -574,10 +647,11 @@ class MusicEngine:
 
         chunks = partition_song_chunks(song_prefix, raw_codec, explicit_seed, context_len=CONTEXT)
         total_chunks = len(chunks)
+
         ode_steps = request.num_inference_steps if request.num_inference_steps is not None else defaults["num_inference_steps"]
         ode_method = request.ode_method if request.ode_method is not None else defaults["ode_method"]
-        latent_pieces = []
 
+        latent_pieces: List[torch.Tensor] = []
         for c_idx, chk in enumerate(chunks):
             solver = CachedNARChunkSolver(self.model, chk["tokens"], chk["noise"])
 
@@ -590,6 +664,7 @@ class MusicEngine:
             latent_pieces.append(chunk_latent)
 
         latents_fp32 = torch.cat(latent_pieces, dim=0).T.unsqueeze(0)
+
         if request.cpu_offload:
             self.model.to("cpu")
             if torch.cuda.is_available():
@@ -619,6 +694,7 @@ class MusicEngine:
 
         if audio_tensor.ndim == 3:
             audio_tensor = audio_tensor.squeeze(0)
+
         if request.apply_declick if request.apply_declick is not None else defaults["apply_declick"]:
             audio_tensor = apply_sub_millisecond_declick(audio_tensor, fade_samples=512)
 
@@ -725,5 +801,6 @@ class MusicEngine:
         sys.stdout.flush()
         dummy_latents = torch.randn((1, 64, 25), device=self.device, dtype=torch.float32)
         _ = self.vae.decode_tiled(dummy_latents, core_frames=16, halo_frames=16, output_device="cpu")
+
         sys.stdout.write(f"  [+] Engine Warmup Completed in {time.perf_counter() - t0:.2f}s.\n")
         sys.stdout.flush()
