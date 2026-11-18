@@ -84,7 +84,9 @@ for _d in (
 tempfile.tempdir = str(TMP_DIR)
 
 USER_AGENT = "IntelliVenv/6.0"
-ALLOC_CONF_POLICY = "garbage_collection_threshold:0.8"
+ALLOC_CONF_POLICY = "garbage_collection_threshold:0.95"
+MIOPEN_DEFAULT_FIND_MODE = "FAST"
+MIOPEN_DEFAULT_LOG_LEVEL = "3"
 DEFAULT_PYTHON_VERSION = "3.14.10"
 FALLBACK_SERIES_VERSIONS: dict[tuple[int, int], str] = {
     (3, 11): "3.11.9",
