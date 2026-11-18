@@ -5,6 +5,7 @@ import ctypes
 import os
 from pathlib import Path
 import re
+import struct
 import sys
 from typing import (
     AbstractSet,
@@ -20,10 +21,22 @@ from typing import (
     Tuple,
     Union,
 )
+import unicodedata
 
 ROOT_DIR = Path(__file__).resolve().parent
 IS_WIN = sys.platform == "win32"
 _DLL_NAME = "tiktalkin.dll" if IS_WIN else "libtiktalkin.so"
+
+_SWISS_MAGICS = (b"TIKTALKIN_SWISS4", b"TIKTALKIN_SWISS5")
+_SWISS_HEADER_FMT = "<16sIIIIIIQQQQQIIQIIQQQ"
+_SWISS_HEADER_SIZE = struct.calcsize(_SWISS_HEADER_FMT)
+_SPECIAL_DISK_FMT = "<iH58s"
+_SPECIAL_DISK_SIZE = struct.calcsize(_SPECIAL_DISK_FMT)
+
+YUE2_PRETOKENIZE_REGEX = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|"
+    r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 
 
 class SpecialDisk(ctypes.Structure):
@@ -52,58 +65,72 @@ class Telemetry(ctypes.Structure):
 
 class _TikTalkinBinding:
     def __init__(self, dll_path: Path):
+        self.dll_path = dll_path
+        if IS_WIN and hasattr(os, "add_dll_directory"):
+            try:
+                os.add_dll_directory(str(dll_path.parent))
+            except Exception:
+                pass
         self.lib = ctypes.CDLL(str(dll_path))
 
-        self.lib.tiktalkin_init.argtypes = [ctypes.c_char_p]
-        self.lib.tiktalkin_init.restype = ctypes.c_void_p
+        init_fn = self.lib.tiktalkin_init
+        encode_fn = self.lib.tiktalkin_encode
+        encode_ord_fn = self.lib.tiktalkin_encode_ordinary
+        decode_fn = self.lib.tiktalkin_decode
+        prefix_fn = self.lib.tiktalkin_find_common_prefix
+        destroy_fn = self.lib.tiktalkin_destroy
+        compile_fn = getattr(self.lib, "tiktalkin_compile_vocab_v5", None) or getattr(
+            self.lib, "tiktalkin_compile_vocab_v4"
+        )
 
-        self.lib.tiktalkin_encode.argtypes = [
+        init_fn.argtypes = [ctypes.c_char_p]
+        init_fn.restype = ctypes.c_void_p
+        self.init = init_fn
+
+        encode_fn.argtypes = [
             ctypes.c_void_p,
             ctypes.c_char_p,
             ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_int32),
             ctypes.c_uint32,
         ]
-        self.lib.tiktalkin_encode.restype = ctypes.c_int32
+        encode_fn.restype = ctypes.c_int32
+        self.encode = encode_fn
 
-        self.lib.tiktalkin_encode_ordinary.argtypes = [
+        encode_ord_fn.argtypes = [
             ctypes.c_void_p,
             ctypes.c_char_p,
             ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_int32),
             ctypes.c_uint32,
         ]
-        self.lib.tiktalkin_encode_ordinary.restype = ctypes.c_int32
+        encode_ord_fn.restype = ctypes.c_int32
+        self.encode_ordinary = encode_ord_fn
 
-        self.lib.tiktalkin_decode.argtypes = [
+        decode_fn.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_int32),
             ctypes.c_uint32,
             ctypes.c_char_p,
             ctypes.c_uint32,
         ]
-        self.lib.tiktalkin_decode.restype = ctypes.c_int32
+        decode_fn.restype = ctypes.c_int32
+        self.decode = decode_fn
 
-        self.lib.tiktalkin_find_common_prefix.argtypes = [
+        prefix_fn.argtypes = [
             ctypes.POINTER(ctypes.c_int32),
             ctypes.c_uint32,
             ctypes.POINTER(ctypes.c_int32),
             ctypes.c_uint32,
         ]
-        self.lib.tiktalkin_find_common_prefix.restype = ctypes.c_uint32
+        prefix_fn.restype = ctypes.c_uint32
+        self.find_common_prefix = prefix_fn
 
-        self.lib.tiktalkin_destroy.argtypes = [ctypes.c_void_p]
-        self.lib.tiktalkin_destroy.restype = None
+        destroy_fn.argtypes = [ctypes.c_void_p]
+        destroy_fn.restype = None
+        self.destroy = destroy_fn
 
-        self.lib.tiktalkin_compile_vocab_with_telemetry.argtypes = [
-            ctypes.c_char_p,
-            ctypes.c_char_p,
-            ctypes.c_char_p,
-            ctypes.POINTER(Telemetry),
-        ]
-        self.lib.tiktalkin_compile_vocab_with_telemetry.restype = ctypes.c_int32
-
-        self.lib.tiktalkin_compile_vocab_v4.argtypes = [
+        compile_fn.argtypes = [
             ctypes.c_char_p,
             ctypes.c_char_p,
             ctypes.c_char_p,
@@ -113,29 +140,30 @@ class _TikTalkinBinding:
             ctypes.c_char_p,
             ctypes.POINTER(Telemetry),
         ]
-        self.lib.tiktalkin_compile_vocab_v4.restype = ctypes.c_int32
+        compile_fn.restype = ctypes.c_int32
+        self.compile_vocab_v5 = compile_fn
 
 
 def _locate_native_library() -> Path:
-    candidates = [
-        ROOT_DIR / _DLL_NAME,
-        ROOT_DIR / "dist" / "bin" / _DLL_NAME,
-        ROOT_DIR / "build" / _DLL_NAME,
-        ROOT_DIR.parent / "dist" / "bin" / _DLL_NAME,
-        ROOT_DIR.parent / "tiktalkin" / _DLL_NAME,
-        ROOT_DIR.parent / "tiktalkin" / "dist" / "bin" / _DLL_NAME,
-        ROOT_DIR.parent / "doodle" / "tiktalkin" / _DLL_NAME,
-        ROOT_DIR.parent / "doodle" / "tiktalkin" / "dist" / "bin" / _DLL_NAME,
-    ]
+    candidates: List[Path] = []
     env_override = os.environ.get("TIKTALKIN_DLL_PATH")
     if env_override:
-        candidates.insert(0, Path(env_override).resolve())
-
+        candidates.append(Path(env_override).resolve())
+    candidates.extend(
+        [
+            ROOT_DIR / _DLL_NAME,
+            ROOT_DIR / "dist" / "bin" / _DLL_NAME,
+            ROOT_DIR / "build" / _DLL_NAME,
+            ROOT_DIR.parent / "dist" / "bin" / _DLL_NAME,
+            ROOT_DIR.parent / "tiktalkin" / _DLL_NAME,
+            ROOT_DIR.parent / "tiktalkin" / "dist" / "bin" / _DLL_NAME,
+        ]
+    )
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
     raise FileNotFoundError(
-        f"Unable to locate {_DLL_NAME}. Placed native binary required in {ROOT_DIR}."
+        f"Unable to locate {_DLL_NAME} in {ROOT_DIR}. Run tools/forge_dag.py first."
     )
 
 
@@ -174,6 +202,50 @@ def build_default_yue2_specials() -> List[Tuple[str, int]]:
     return specials
 
 
+def _inspect_swiss_container(
+    ranks_path: Path,
+) -> Optional[Tuple[int, int, int, bool, List[Tuple[str, int]]]]:
+    try:
+        with open(ranks_path, "rb") as f:
+            hdr_bytes = f.read(_SWISS_HEADER_SIZE)
+            if len(hdr_bytes) < _SWISS_HEADER_SIZE:
+                return None
+            unpacked = struct.unpack(_SWISS_HEADER_FMT, hdr_bytes)
+            magic = unpacked[0]
+            if magic not in _SWISS_MAGICS:
+                return None
+            vocab_size = int(unpacked[2])
+            total_vocab_size = int(unpacked[3])
+            specials_count = int(unpacked[13])
+            specials_offset = int(unpacked[14])
+            eot_token_id = int(unpacked[15])
+            fast_magic = int(unpacked[16])
+            has_fast_tables = fast_magic == 0x54544B35
+            specials: List[Tuple[str, int]] = []
+            if specials_offset > 0 and specials_count > 0:
+                f.seek(specials_offset)
+                raw_spec = f.read(specials_count * _SPECIAL_DISK_SIZE)
+                for i in range(specials_count):
+                    chunk = raw_spec[
+                        i * _SPECIAL_DISK_SIZE : (i + 1) * _SPECIAL_DISK_SIZE
+                    ]
+                    if len(chunk) < _SPECIAL_DISK_SIZE:
+                        break
+                    sid, slen, slit = struct.unpack(_SPECIAL_DISK_FMT, chunk)
+                    lit_str = slit[:slen].decode("utf-8", errors="replace")
+                    if lit_str:
+                        specials.append((lit_str, int(sid)))
+            return (
+                vocab_size,
+                total_vocab_size,
+                eot_token_id,
+                has_fast_tables,
+                specials,
+            )
+    except Exception:
+        return None
+
+
 def compile_vocab(
     in_tiktoken_path: Union[str, Path],
     out_bin_path: Union[str, Path],
@@ -183,8 +255,10 @@ def compile_vocab(
     eot_token_id: int = 151643,
 ) -> Telemetry:
     binding = get_binding()
-    in_path_str = str(Path(in_tiktoken_path).resolve()).encode("utf-8")
-    out_path_str = str(Path(out_bin_path).resolve()).encode("utf-8")
+    in_path = Path(in_tiktoken_path).resolve()
+    out_path = Path(out_bin_path).resolve()
+    in_path_str = str(in_path).encode("utf-8")
+    out_path_str = str(out_path).encode("utf-8")
     telem_path_str = (
         str(Path(out_telemetry_json).resolve()).encode("utf-8")
         if out_telemetry_json
@@ -202,13 +276,14 @@ def compile_vocab(
         lit_bytes = literal.encode("utf-8")[:57]
         specials_arr[idx].length = len(lit_bytes)
         specials_arr[idx].literal = lit_bytes
+    specials_ptr = ctypes.cast(specials_arr, ctypes.POINTER(SpecialDisk))
 
     telem = Telemetry()
-    rc = binding.lib.tiktalkin_compile_vocab_v4(
+    rc = binding.compile_vocab_v5(
         in_path_str,
         out_path_str,
         pat_str,
-        specials_arr,
+        specials_ptr,
         specials_count,
         int(eot_token_id),
         telem_path_str,
@@ -227,7 +302,7 @@ def compile_qwen_ranks_binary(
     if src.is_dir():
         vocab_path = src / "qwen.tiktoken"
         if not vocab_path.exists():
-            matches = list(src.rglob("*.tiktoken"))
+            matches = sorted(src.rglob("*.tiktoken"))
             if not matches:
                 raise FileNotFoundError(f"No .tiktoken file located in {src}")
             vocab_path = matches[0]
@@ -237,11 +312,11 @@ def compile_qwen_ranks_binary(
     if not vocab_path.exists():
         raise FileNotFoundError(f"Vocabulary file missing: {vocab_path}")
 
-    if target_bin_path is None:
-        dest_bin = vocab_path.with_suffix(".ranks.bin")
-    else:
-        dest_bin = Path(target_bin_path).resolve()
-
+    dest_bin = (
+        Path(target_bin_path).resolve()
+        if target_bin_path is not None
+        else vocab_path.with_suffix(".ranks.bin")
+    )
     dest_bin.parent.mkdir(parents=True, exist_ok=True)
     compile_vocab(vocab_path, dest_bin)
     return dest_bin
@@ -267,20 +342,13 @@ def find_common_prefix(
 
         is_arr_a = isinstance(tokens_a, np.ndarray)
         is_arr_b = isinstance(tokens_b, np.ndarray)
-        if is_arr_a or is_arr_b or limit > 32:
+        if is_arr_a or is_arr_b or limit > 16:
             arr_a = np.ascontiguousarray(tokens_a[:limit], dtype=np.int32)
             arr_b = np.ascontiguousarray(tokens_b[:limit], dtype=np.int32)
             binding = get_binding()
-            if hasattr(binding.lib, "tiktalkin_find_common_prefix"):
-                ptr_a = arr_a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-                ptr_b = arr_b.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
-                return int(
-                    binding.lib.tiktalkin_find_common_prefix(
-                        ptr_a, limit, ptr_b, limit
-                    )
-                )
-            mismatches = np.flatnonzero(arr_a != arr_b)
-            return int(mismatches[0]) if mismatches.size > 0 else limit
+            ptr_a = arr_a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+            ptr_b = arr_b.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+            return int(binding.find_common_prefix(ptr_a, limit, ptr_b, limit))
     except Exception:
         pass
 
@@ -299,8 +367,8 @@ class Encoding:
     ):
         self._name = name
         self._binding = get_binding()
-
         resolved_ranks: Optional[Path] = None
+
         if ranks_path is not None:
             p = Path(ranks_path).resolve()
             if p.is_file() and p.suffix == ".bin":
@@ -322,20 +390,18 @@ class Encoding:
                         )
 
         if resolved_ranks is None or not resolved_ranks.exists():
-            search_candidates = [
-                ROOT_DIR / "qwen.ranks.bin",
-                ROOT_DIR / "dist" / "bin" / "qwen.ranks.bin",
-                ROOT_DIR.parent / "qwen.ranks.bin",
-                ROOT_DIR.parent / "dist" / "bin" / "qwen.ranks.bin",
-                ROOT_DIR.parent / "tiktalkin" / "qwen.ranks.bin",
-                ROOT_DIR.parent / "tiktalkin" / "dist" / "bin" / "qwen.ranks.bin",
-                ROOT_DIR.parent / "doodle" / "tiktalkin" / "qwen.ranks.bin",
-                ROOT_DIR.parent / "doodle" / "tiktalkin" / "dist" / "bin" / "qwen.ranks.bin",
-            ]
+            search_candidates: List[Path] = []
             env_ranks = os.environ.get("TIKTALKIN_RANKS_PATH")
             if env_ranks:
-                search_candidates.insert(0, Path(env_ranks).resolve())
-
+                search_candidates.append(Path(env_ranks).resolve())
+            search_candidates.extend(
+                [
+                    ROOT_DIR / "qwen.ranks.bin",
+                    ROOT_DIR / "dist" / "bin" / "qwen.ranks.bin",
+                    ROOT_DIR.parent / "dist" / "bin" / "qwen.ranks.bin",
+                    ROOT_DIR.parent / "tiktalkin" / "dist" / "bin" / "qwen.ranks.bin",
+                ]
+            )
             for cand in search_candidates:
                 if cand.is_file():
                     resolved_ranks = cand
@@ -343,33 +409,49 @@ class Encoding:
 
         if resolved_ranks is None or not resolved_ranks.exists():
             raise FileNotFoundError(
-                f"Could not resolve ranks container. Placed binary required in {ROOT_DIR}."
+                f"Could not resolve YuE2 ranks container in {ROOT_DIR}."
             )
 
         self._ranks_path = resolved_ranks
-        self._ctx = self._binding.lib.tiktalkin_init(
-            str(self._ranks_path).encode("utf-8")
-        )
+        self._ctx = self._binding.init(str(self._ranks_path).encode("utf-8"))
         if not self._ctx:
             raise RuntimeError(
                 f"Failed to initialize TikTalkin context from {self._ranks_path}"
             )
 
-        self._n_vocab = 184704
-        self._eot_token = 151643
+        inspected = _inspect_swiss_container(self._ranks_path)
+        if inspected is not None:
+            base_v, total_v, eot_id, has_fast, spec_list = inspected
+            self._base_vocab_size = base_v
+            self._n_vocab = max(base_v, total_v, 184704)
+            self._eot_token = eot_id if eot_id > 0 else 151643
+            self._has_fast_tables = has_fast
+            defaults = spec_list if spec_list else build_default_yue2_specials()
+        else:
+            self._base_vocab_size = 151643
+            self._n_vocab = 184704
+            self._eot_token = 151643
+            self._has_fast_tables = False
+            defaults = build_default_yue2_specials()
 
-        defaults = build_default_yue2_specials()
         self._special_token_to_id: Dict[str, int] = {
             literal: s_id for literal, s_id in defaults
         }
         self._special_tokens_set: Set[str] = set(self._special_token_to_id.keys())
+        self._special_tokens_tuple: Tuple[str, ...] = tuple(
+            sorted(self._special_tokens_set, key=len, reverse=True)
+        )
+        self._all_specials_start_with_lt: bool = bool(
+            self._special_tokens_tuple
+            and all(s.startswith("<") for s in self._special_tokens_tuple)
+        )
         self._id_to_special_token: Dict[int, str] = {
             s_id: literal for literal, s_id in defaults
         }
 
     def close(self) -> None:
         if hasattr(self, "_ctx") and self._ctx:
-            self._binding.lib.tiktalkin_destroy(self._ctx)
+            self._binding.destroy(self._ctx)
             self._ctx = None
 
     def __del__(self) -> None:
@@ -384,6 +466,18 @@ class Encoding:
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def ranks_path(self) -> Path:
+        return self._ranks_path
+
+    @property
+    def has_fast_tables(self) -> bool:
+        return self._has_fast_tables
+
+    @property
+    def base_vocab_size(self) -> int:
+        return self._base_vocab_size
 
     @property
     def n_vocab(self) -> int:
@@ -401,6 +495,20 @@ class Encoding:
     def special_token_to_id(self) -> Dict[str, int]:
         return self._special_token_to_id
 
+    def _encode_all_special_unchecked(self, text: str) -> List[int]:
+        if not text:
+            return []
+        if not self._ctx:
+            raise RuntimeError("Operation attempted on closed TikTalkin context.")
+        raw = text.encode("utf-8")
+        byte_len = len(raw)
+        max_tokens = max(byte_len, 16)
+        out_buf = (ctypes.c_int32 * max_tokens)()
+        count = self._binding.encode(
+            self._ctx, raw, byte_len, out_buf, max_tokens
+        )
+        return list(out_buf[:count])
+
     def encode_ordinary(self, text: str) -> List[int]:
         if not text:
             return []
@@ -410,8 +518,7 @@ class Encoding:
         byte_len = len(raw)
         max_tokens = max(byte_len, 16)
         out_buf = (ctypes.c_int32 * max_tokens)()
-
-        count = self._binding.lib.tiktalkin_encode_ordinary(
+        count = self._binding.encode_ordinary(
             self._ctx, raw, byte_len, out_buf, max_tokens
         )
         return list(out_buf[:count])
@@ -429,47 +536,43 @@ class Encoding:
             raise RuntimeError("Operation attempted on closed TikTalkin context.")
 
         if disallowed_special == "all":
-            allowed_reference = (
-                self._special_tokens_set
-                if allowed_special == "all"
-                else set(allowed_special)
-            )
-            disallowed = self._special_tokens_set - allowed_reference
-            for special in disallowed:
-                if special in text:
-                    raise ValueError(
-                        f"Encountered text corresponding to disallowed special token {special!r}."
-                    )
+            if allowed_special != "all":
+                if not self._all_specials_start_with_lt or "<" in text:
+                    if not allowed_special:
+                        for special in self._special_tokens_tuple:
+                            if special in text:
+                                raise ValueError(
+                                    f"Encountered text corresponding to disallowed special token {special!r}."
+                                )
+                    else:
+                        disallowed = self._special_tokens_set - set(allowed_special)
+                        for special in disallowed:
+                            if special in text:
+                                raise ValueError(
+                                    f"Encountered text corresponding to disallowed special token {special!r}."
+                                )
         elif disallowed_special:
-            for special in disallowed_special:
-                if special in text:
-                    raise ValueError(
-                        f"Encountered text corresponding to disallowed special token {special!r}."
-                    )
+            if not self._all_specials_start_with_lt or "<" in text or any(
+                not s.startswith("<") for s in disallowed_special
+            ):
+                for special in disallowed_special:
+                    if special in text:
+                        raise ValueError(
+                            f"Encountered text corresponding to disallowed special token {special!r}."
+                        )
 
         if allowed_special == "all":
-            raw = text.encode("utf-8")
-            byte_len = len(raw)
-            max_tokens = max(byte_len, 16)
-            out_buf = (ctypes.c_int32 * max_tokens)()
-            count = self._binding.lib.tiktalkin_encode(
-                self._ctx, raw, byte_len, out_buf, max_tokens
-            )
-            return list(out_buf[:count])
+            return self._encode_all_special_unchecked(text)
 
         if not allowed_special:
             return self.encode_ordinary(text)
 
         allowed_set = set(allowed_special)
         if allowed_set >= self._special_tokens_set:
-            raw = text.encode("utf-8")
-            byte_len = len(raw)
-            max_tokens = max(byte_len, 16)
-            out_buf = (ctypes.c_int32 * max_tokens)()
-            count = self._binding.lib.tiktalkin_encode(
-                self._ctx, raw, byte_len, out_buf, max_tokens
-            )
-            return list(out_buf[:count])
+            return self._encode_all_special_unchecked(text)
+
+        if self._all_specials_start_with_lt and "<" not in text:
+            return self.encode_ordinary(text)
 
         valid_allowed = [s for s in allowed_set if s in self._special_tokens_set]
         if not valid_allowed:
@@ -479,7 +582,6 @@ class Encoding:
         valid_allowed.sort(key=len, reverse=True)
         pattern = f"({'|'.join(re.escape(s) for s in valid_allowed)})"
         parts = re.split(pattern, text)
-
         result: List[int] = []
         for part in parts:
             if not part:
@@ -489,6 +591,46 @@ class Encoding:
             else:
                 result.extend(self.encode_ordinary(part))
         return result
+
+    def encode_yue2_sequence(
+        self,
+        prompt_text: str,
+        abc_text: Optional[str] = None,
+        codec_tokens: Optional[Sequence[int]] = None,
+        latent_frames: int = 0,
+        max_sequence_length: int = 24576,
+    ) -> List[int]:
+        eod_id = self._special_token_to_id.get("<|endoftext|>", 151643)
+        abc_start = self._special_token_to_id.get("<abc>", 151847)
+        abc_end = self._special_token_to_id.get("</abc>", 151848)
+        music_start = self._special_token_to_id.get("<music_start>", 151851)
+        music_end = self._special_token_to_id.get("<music_end>", 151852)
+        lat_start = self._special_token_to_id.get("<latent_start>", 184621)
+        lat_end = self._special_token_to_id.get("<latent_end>", 184622)
+        lat_pad = self._special_token_to_id.get("<latent_pad>", 184623)
+
+        norm_prompt = unicodedata.normalize("NFC", prompt_text)
+        toks: List[int] = [eod_id]
+        toks.extend(self.encode_ordinary(norm_prompt))
+        toks.append(abc_start)
+        if abc_text is not None and abc_text.strip():
+            norm_abc = unicodedata.normalize("NFC", abc_text.strip())
+            toks.extend(self.encode_ordinary(norm_abc))
+        toks.append(abc_end)
+        toks.append(music_start)
+
+        if codec_tokens:
+            toks.extend(int(t) for t in codec_tokens)
+            toks.append(music_end)
+
+        if latent_frames > 0:
+            toks.append(lat_start)
+            toks.extend([lat_pad] * int(latent_frames))
+            toks.append(lat_end)
+
+        if max_sequence_length > 0 and len(toks) > max_sequence_length:
+            toks = toks[:max_sequence_length]
+        return toks
 
     def encode_batch(
         self,
@@ -561,16 +703,14 @@ class Encoding:
 
         alloc_size = max(count * 8 + 64, 1024)
         buf = ctypes.create_string_buffer(alloc_size)
-
-        needed = self._binding.lib.tiktalkin_decode(
+        needed = self._binding.decode(
             self._ctx, c_tokens, count, buf, alloc_size
         )
         if needed >= alloc_size:
             buf = ctypes.create_string_buffer(needed + 1)
-            needed = self._binding.lib.tiktalkin_decode(
+            needed = self._binding.decode(
                 self._ctx, c_tokens, count, buf, needed + 1
             )
-
         return buf.raw[:needed].decode("utf-8", errors=errors)
 
     def decode_batch(

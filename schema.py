@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -37,6 +36,7 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "cfg_scale": 1.0000,
     "num_inference_steps": 32,
     "ode_method": "midpoint",
+    "nar_text_only": False,
     "vae_core_frames": 1024,
     "vae_halo_frames": 16,
     "apply_declick": True,
@@ -75,7 +75,7 @@ def normalize_lyrics(lyrics: Optional[str]) -> str:
         if match:
             for tag in re.findall(r"\[[^\]]+\]", match.group(1)):
                 lines.append(tag.strip().lower())
-            rem = line[match.end():].strip()
+            rem = line[match.end() :].strip()
             if rem:
                 lines.append(rem)
         else:
@@ -95,7 +95,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
         c = data["cot"].strip().lower()
         if c in SUPPORTED_COT:
             harvested["cot"] = c
-
     for key, (lo, hi) in [
         ("temperature", (0.0001, 5.0)),
         ("top_p", (0.0001, 1.0)),
@@ -110,7 +109,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
                 harvested[key] = max(lo, min(hi, float(data[key])))
             except (ValueError, TypeError):
                 pass
-
     for key, (lo, hi) in [
         ("top_k", (1, 500)),
         ("penalty_window", (1, 200)),
@@ -125,21 +123,22 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
                 harvested[key] = max(lo, min(hi, int(data[key])))
             except (ValueError, TypeError):
                 pass
-
     if "ode_method" in data and isinstance(data["ode_method"], str):
         method = data["ode_method"].strip().lower()
         if method in SUPPORTED_ODE_METHODS:
             harvested["ode_method"] = method
-
-    for key in ["apply_declick", "cpu_offload", "is_instrumental"]:
+    for key in [
+        "apply_declick",
+        "nar_text_only",
+        "cpu_offload",
+        "is_instrumental",
+    ]:
         if key in data and data[key] is not None:
             harvested[key] = bool(data[key])
-
     if "instrumental_branch" in data and isinstance(data["instrumental_branch"], str):
         br = data["instrumental_branch"].strip().lower()
         if br in SUPPORTED_INSTRUMENTAL_BRANCHES:
             harvested["instrumental_branch"] = br
-
     return harvested
 
 
@@ -147,7 +146,6 @@ def locate_default_preset_file() -> Optional[Path]:
     candidates = [
         DOODLE_ROOT / DEFAULT_PRESET_FILENAME,
         DOODLE_ROOT / "presets" / DEFAULT_PRESET_FILENAME,
-        DOODLE_ROOT.parent / "config" / DEFAULT_PRESET_FILENAME,
     ]
     env_preset = os.environ.get("DOODLE_DEFAULT_JSON")
     if env_preset:
@@ -168,15 +166,12 @@ def get_active_engine_defaults() -> Dict[str, Any]:
             _PRESET_CACHE["path"] = None
             _PRESET_CACHE["defaults"] = dict(BASELINE_ENGINE_DEFAULTS)
         return dict(_PRESET_CACHE["defaults"])
-
     try:
         current_mtime = preset_file.stat().st_mtime
     except OSError:
         return dict(_PRESET_CACHE["defaults"])
-
     if _PRESET_CACHE["path"] == preset_file and _PRESET_CACHE["mtime"] == current_mtime:
         return dict(_PRESET_CACHE["defaults"])
-
     try:
         with open(preset_file, "r", encoding="utf-8") as f:
             raw_payload = json.load(f)
@@ -217,6 +212,8 @@ class GenerationRequest(BaseModel):
     prompt: Optional[str] = Field(default=None, max_length=16384)
     cot: Optional[str] = Field(default=None)
     abc: Optional[str] = Field(default=None, max_length=65536)
+    reference_audio_path: Optional[str] = Field(default=None, max_length=2048)
+    reference_duration: Optional[float] = Field(default=None, ge=0.5, le=120.0)
     temperature: Optional[float] = Field(default=None, ge=0.0001, le=5.0)
     top_p: Optional[float] = Field(default=None, ge=0.0001, le=1.0)
     top_k: Optional[int] = Field(default=None, ge=1, le=500)
@@ -230,6 +227,7 @@ class GenerationRequest(BaseModel):
     cfg_scale: Optional[float] = Field(default=None, ge=0.0, le=20.0)
     num_inference_steps: Optional[int] = Field(default=None, ge=1, le=200)
     ode_method: Optional[str] = Field(default=None)
+    nar_text_only: Optional[bool] = Field(default=None)
     vae_core_frames: Optional[int] = Field(default=None, ge=128, le=4096)
     vae_halo_frames: Optional[int] = Field(default=None, ge=16, le=128)
     audio_duration: float = Field(default=240.0, ge=1.0, le=600.0)
@@ -272,6 +270,7 @@ class GenerationRequest(BaseModel):
         "abc_repetition_penalty",
         "cfg_scale",
         "audio_duration",
+        "reference_duration",
         mode="before",
     )
     @classmethod
@@ -307,42 +306,30 @@ class GenerationRequest(BaseModel):
         active = get_active_engine_defaults()
         use_custom = has_custom_default_preset()
 
-        if self.cot is None or (use_custom and self.cot == BASELINE_ENGINE_DEFAULTS["cot"]):
-            self.cot = str(active["cot"])
-        if self.temperature is None or (use_custom and self.temperature == BASELINE_ENGINE_DEFAULTS["temperature"]):
-            self.temperature = float(active["temperature"])
-        if self.top_p is None or (use_custom and self.top_p == BASELINE_ENGINE_DEFAULTS["top_p"]):
-            self.top_p = float(active["top_p"])
-        if self.top_k is None or (use_custom and self.top_k == BASELINE_ENGINE_DEFAULTS["top_k"]):
-            self.top_k = int(active["top_k"])
-        if self.repetition_penalty is None or (use_custom and self.repetition_penalty == BASELINE_ENGINE_DEFAULTS["repetition_penalty"]):
-            self.repetition_penalty = float(active["repetition_penalty"])
-        if self.penalty_window is None or (use_custom and self.penalty_window == BASELINE_ENGINE_DEFAULTS["penalty_window"]):
-            self.penalty_window = int(active["penalty_window"])
-        if self.abc_temperature is None or (use_custom and self.abc_temperature == BASELINE_ENGINE_DEFAULTS["abc_temperature"]):
-            self.abc_temperature = float(active["abc_temperature"])
-        if self.abc_top_p is None or (use_custom and self.abc_top_p == BASELINE_ENGINE_DEFAULTS["abc_top_p"]):
-            self.abc_top_p = float(active["abc_top_p"])
-        if self.abc_top_k is None or (use_custom and self.abc_top_k == BASELINE_ENGINE_DEFAULTS["abc_top_k"]):
-            self.abc_top_k = int(active["abc_top_k"])
-        if self.abc_repetition_penalty is None or (use_custom and self.abc_repetition_penalty == BASELINE_ENGINE_DEFAULTS["abc_repetition_penalty"]):
-            self.abc_repetition_penalty = float(active["abc_repetition_penalty"])
-        if self.abc_penalty_window is None or (use_custom and self.abc_penalty_window == BASELINE_ENGINE_DEFAULTS["abc_penalty_window"]):
-            self.abc_penalty_window = int(active["abc_penalty_window"])
-        if self.cfg_scale is None or (use_custom and self.cfg_scale == BASELINE_ENGINE_DEFAULTS["cfg_scale"]):
-            self.cfg_scale = float(active["cfg_scale"])
-        if self.num_inference_steps is None or (use_custom and self.num_inference_steps == BASELINE_ENGINE_DEFAULTS["num_inference_steps"]):
-            self.num_inference_steps = int(active["num_inference_steps"])
-        if self.ode_method is None or (use_custom and self.ode_method == BASELINE_ENGINE_DEFAULTS["ode_method"]):
-            self.ode_method = str(active["ode_method"])
-        if self.vae_core_frames is None or (use_custom and self.vae_core_frames == BASELINE_ENGINE_DEFAULTS["vae_core_frames"]):
-            self.vae_core_frames = int(active["vae_core_frames"])
-        if self.vae_halo_frames is None or (use_custom and self.vae_halo_frames == BASELINE_ENGINE_DEFAULTS["vae_halo_frames"]):
-            self.vae_halo_frames = int(active["vae_halo_frames"])
-        if self.apply_declick is None or (use_custom and self.apply_declick == BASELINE_ENGINE_DEFAULTS["apply_declick"]):
-            self.apply_declick = bool(active["apply_declick"])
-        if self.cpu_offload is None or (use_custom and self.cpu_offload == BASELINE_ENGINE_DEFAULTS["cpu_offload"]):
-            self.cpu_offload = bool(active["cpu_offload"])
+        def _sync_field(attr: str, cast_fn):
+            cur = getattr(self, attr)
+            if cur is None or (use_custom and cur == BASELINE_ENGINE_DEFAULTS[attr]):
+                setattr(self, attr, cast_fn(active[attr]))
+
+        _sync_field("cot", str)
+        _sync_field("temperature", float)
+        _sync_field("top_p", float)
+        _sync_field("top_k", int)
+        _sync_field("repetition_penalty", float)
+        _sync_field("penalty_window", int)
+        _sync_field("abc_temperature", float)
+        _sync_field("abc_top_p", float)
+        _sync_field("abc_top_k", int)
+        _sync_field("abc_repetition_penalty", float)
+        _sync_field("abc_penalty_window", int)
+        _sync_field("cfg_scale", float)
+        _sync_field("num_inference_steps", int)
+        _sync_field("ode_method", str)
+        _sync_field("nar_text_only", bool)
+        _sync_field("vae_core_frames", int)
+        _sync_field("vae_halo_frames", int)
+        _sync_field("apply_declick", bool)
+        _sync_field("cpu_offload", bool)
 
         if not self.is_instrumental:
             if not self.vocal_lead and self.vocals:
@@ -360,7 +347,6 @@ class GenerationRequest(BaseModel):
                     self.vocals = ""
             elif not self.vocals and self.instrumental_lead:
                 self.vocals = self.instrumental_lead
-
         return self
 
     def compile_style(self) -> str:
@@ -368,32 +354,43 @@ class GenerationRequest(BaseModel):
         if override and override.strip():
             return clean_caption(override.strip())
         parts: List[str] = []
-        genre_desc = " / ".join(filter(None, [self.genre.strip(), self.subgenre.strip()]))
+        genre_desc = " / ".join(
+            filter(None, [self.genre.strip(), self.subgenre.strip()])
+        )
         if genre_desc:
             parts.append(genre_desc)
         if self.bpm and self.bpm > 0:
             parts.append(f"{self.bpm} bpm")
-
         key_clean = self.key.strip() if self.key else ""
         if key_clean:
-            key_match = re.match(r"^([A-G][b#]?)(?:\s*(major|minor|min|maj|m))?\s*$", key_clean, re.IGNORECASE)
+            key_match = re.match(
+                r"^([A-G][b#]?)(?:\s*(major|minor|min|maj|m))?\s*$",
+                key_clean,
+                re.IGNORECASE,
+            )
             if key_match:
                 raw_root = key_match.group(1)
-                key_root = raw_root[0].upper() + raw_root[1:].lower() if len(raw_root) > 1 else raw_root.upper()
+                key_root = (
+                    raw_root[0].upper() + raw_root[1:].lower()
+                    if len(raw_root) > 1
+                    else raw_root.upper()
+                )
                 mode_token = (key_match.group(2) or "").lower()
-                scale_mode = "minor" if mode_token in ("minor", "min", "m") else "major"
+                scale_mode = (
+                    "minor" if mode_token in ("minor", "min", "m") else "major"
+                )
                 parts.append(f"{key_root} {scale_mode}")
             else:
                 parts.append(key_clean)
-
         if self.mood and self.mood.strip():
             parts.append(self.mood.strip().rstrip("."))
-        lead_desc = (self.instrumental_lead if self.is_instrumental else self.vocal_lead) or self.vocals
+        lead_desc = (
+            self.instrumental_lead if self.is_instrumental else self.vocal_lead
+        ) or self.vocals
         if lead_desc and lead_desc.strip():
             parts.append(lead_desc.strip().rstrip("."))
         if self.arrangement and self.arrangement.strip():
             parts.append(self.arrangement.strip().rstrip("."))
-
         compiled = ", ".join(filter(None, parts))
         return clean_caption(compiled)
 
@@ -409,15 +406,24 @@ class GenerationRequest(BaseModel):
                             continue
                         lbl = b.get("label") or b.get("type") or "verse"
                         txt = (b.get("text") or "").strip()
-                        clean_lbl = re.sub(r"[\[\]]", "", str(lbl)).strip().lower() or "verse"
+                        clean_lbl = (
+                            re.sub(r"[\[\]]", "", str(lbl)).strip().lower() or "verse"
+                        )
                         if txt:
-                            clean_txt = txt if txt.startswith("(") and txt.endswith(")") else f"({txt})"
+                            clean_txt = (
+                                txt
+                                if txt.startswith("(") and txt.endswith(")")
+                                else f"({txt})"
+                            )
                             compiled.append(f"[{clean_lbl}]\n{clean_txt}")
                         else:
                             compiled.append(f"[{clean_lbl}]")
                     return normalize_lyrics("\n\n".join(compiled))
-
-                active_raw = self.instrumental_lyrics if self.instrumental_lyrics.strip() else self.lyrics
+                active_raw = (
+                    self.instrumental_lyrics
+                    if self.instrumental_lyrics.strip()
+                    else self.lyrics
+                )
                 if active_raw and active_raw.strip():
                     lines = active_raw.replace("\r\n", "\n").splitlines()
                     compiled = []
@@ -429,35 +435,63 @@ class GenerationRequest(BaseModel):
                         if match:
                             for t in re.findall(r"\[[^\]]+\]", match.group(1)):
                                 compiled.append(t.strip().lower())
-                            rem = trimmed[match.end():].strip()
+                            rem = trimmed[match.end() :].strip()
                             if rem:
-                                compiled.append(rem if rem.startswith("(") and rem.endswith(")") else f"({rem})")
+                                compiled.append(
+                                    rem
+                                    if rem.startswith("(") and rem.endswith(")")
+                                    else f"({rem})"
+                                )
                         else:
-                            compiled.append(trimmed if trimmed.startswith("(") and trimmed.endswith(")") else f"({trimmed})")
+                            compiled.append(
+                                trimmed
+                                if trimmed.startswith("(") and trimmed.endswith(")")
+                                else f"({trimmed})"
+                            )
                     return normalize_lyrics("\n".join(compiled))
-                return normalize_lyrics("[intro]\n\n[theme a]\n\n[verse]\n\n[chorus]\n\n[solo]\n\n[breakdown]\n\n[outro]")
+                return normalize_lyrics(
+                    "[intro]\n\n[theme a]\n\n[verse]\n\n[chorus]\n\n[solo]\n\n[breakdown]\n\n[outro]"
+                )
             elif branch == "tags_only":
                 active_blocks = self.instrumental_blocks or self.blocks
                 if active_blocks:
-                    tags = [f"[{re.sub(r'[\[\]]', '', str(b.get('label') or b.get('type') or 'verse')).strip().lower()}]" for b in active_blocks if isinstance(b, dict)]
+                    tags = [
+                        f"[{re.sub(r'[\[\]]', '', str(b.get('label') or b.get('type') or 'verse')).strip().lower()}]"
+                        for b in active_blocks
+                        if isinstance(b, dict)
+                    ]
                     return normalize_lyrics("\n\n".join(tags))
-                active_raw = self.instrumental_lyrics if self.instrumental_lyrics.strip() else self.lyrics
+                active_raw = (
+                    self.instrumental_lyrics
+                    if self.instrumental_lyrics.strip()
+                    else self.lyrics
+                )
                 if active_raw and active_raw.strip():
-                    tags = [m.group(0).lower() for m in re.finditer(r"\[([^\]]+)\]", active_raw)]
+                    tags = [
+                        m.group(0).lower()
+                        for m in re.finditer(r"\[([^\]]+)\]", active_raw)
+                    ]
                     if tags:
                         return normalize_lyrics("\n\n".join(tags))
-                return normalize_lyrics("[intro]\n\n[theme a]\n\n[verse]\n\n[chorus]\n\n[solo]\n\n[breakdown]\n\n[outro]")
-
+                return normalize_lyrics(
+                    "[intro]\n\n[theme a]\n\n[verse]\n\n[chorus]\n\n[solo]\n\n[breakdown]\n\n[outro]"
+                )
         if self.blocks:
             compiled_blocks = []
             for b in self.blocks:
                 if not isinstance(b, dict):
                     continue
-                lbl = re.sub(r"[\[\]]", "", str(b.get("label") or b.get("type") or "verse")).strip().lower() or "verse"
+                lbl = (
+                    re.sub(
+                        r"[\[\]]", "", str(b.get("label") or b.get("type") or "verse")
+                    )
+                    .strip()
+                    .lower()
+                    or "verse"
+                )
                 txt = (b.get("text") or "").strip()
                 compiled_blocks.append(f"[{lbl}]\n{txt}" if txt else f"[{lbl}]")
             return normalize_lyrics("\n\n".join(compiled_blocks))
-
         if self.lyrics and self.lyrics.strip():
             return normalize_lyrics(self.lyrics)
         return ""
@@ -471,33 +505,67 @@ class GenerationRequest(BaseModel):
 
     def validate(self) -> None:
         if self.audio_duration <= 0.0 or self.audio_duration > 600.0:
-            raise ValueError(f"Audio duration {self.audio_duration}s exceeds supported span (0.0 < t <= 600.0).")
+            raise ValueError(
+                f"Audio duration {self.audio_duration}s exceeds supported span (0.0 < t <= 600.0)."
+            )
         if self.bpm is not None and self.bpm != 0 and (self.bpm < 30 or self.bpm > 300):
-            raise ValueError(f"BPM {self.bpm} outside musical range (30-300 or 0 for unmetered).")
+            raise ValueError(
+                f"BPM {self.bpm} outside musical range (30-300 or 0 for unmetered)."
+            )
         if self.cot not in SUPPORTED_COT:
-            raise ValueError(f"CoT mode '{self.cot}' invalid. Supported: {SUPPORTED_COT}")
+            raise ValueError(
+                f"CoT mode '{self.cot}' invalid. Supported: {SUPPORTED_COT}"
+            )
         if self.ode_method not in SUPPORTED_ODE_METHODS:
-            raise ValueError(f"ODE method '{self.ode_method}' invalid. Supported: {SUPPORTED_ODE_METHODS}")
+            raise ValueError(
+                f"ODE method '{self.ode_method}' invalid. Supported: {SUPPORTED_ODE_METHODS}"
+            )
         if self.instrumental_branch not in SUPPORTED_INSTRUMENTAL_BRANCHES:
-            raise ValueError(f"Instrumental branch '{self.instrumental_branch}' invalid. Supported: {SUPPORTED_INSTRUMENTAL_BRANCHES}")
+            raise ValueError(
+                f"Instrumental branch '{self.instrumental_branch}' invalid. Supported: {SUPPORTED_INSTRUMENTAL_BRANCHES}"
+            )
         if self.num_inference_steps < 1 or self.num_inference_steps > 200:
-            raise ValueError(f"Inference steps {self.num_inference_steps} out of bounds (1-200).")
+            raise ValueError(
+                f"Inference steps {self.num_inference_steps} out of bounds (1-200)."
+            )
         if self.cfg_scale < 0.0 or self.cfg_scale > 20.0:
-            raise ValueError(f"Guidance scale {self.cfg_scale} out of bounds (0.0-20.0).")
+            raise ValueError(
+                f"Guidance scale {self.cfg_scale} out of bounds (0.0-20.0)."
+            )
         if self.temperature <= 0.0 or self.temperature > 5.0:
-            raise ValueError(f"Semantic temperature {self.temperature} out of bounds (0.0 < T <= 5.0).")
+            raise ValueError(
+                f"Semantic temperature {self.temperature} out of bounds (0.0 < T <= 5.0)."
+            )
         if self.top_p <= 0.0 or self.top_p > 1.0:
-            raise ValueError(f"Semantic Top-P {self.top_p} out of bounds (0.0 < p <= 1.0).")
+            raise ValueError(
+                f"Semantic Top-P {self.top_p} out of bounds (0.0 < p <= 1.0)."
+            )
         if self.top_k < 1 or self.top_k > 500:
-            raise ValueError(f"Semantic Top-K {self.top_k} out of bounds (1-500).")
+            raise ValueError(
+                f"Semantic Top-K {self.top_k} out of bounds (1-500)."
+            )
         if self.abc_temperature <= 0.0 or self.abc_temperature > 5.0:
-            raise ValueError(f"ABC temperature {self.abc_temperature} out of bounds (0.0 < T <= 5.0).")
+            raise ValueError(
+                f"ABC temperature {self.abc_temperature} out of bounds (0.0 < T <= 5.0)."
+            )
         if self.abc_top_p <= 0.0 or self.abc_top_p > 1.0:
-            raise ValueError(f"ABC Top-P {self.abc_top_p} out of bounds (0.0 < p <= 1.0).")
+            raise ValueError(
+                f"ABC Top-P {self.abc_top_p} out of bounds (0.0 < p <= 1.0)."
+            )
         if self.abc_top_k < 1 or self.abc_top_k > 500:
-            raise ValueError(f"ABC Top-K {self.abc_top_k} out of bounds (1-500).")
+            raise ValueError(
+                f"ABC Top-K {self.abc_top_k} out of bounds (1-500)."
+            )
         if self.vae_halo_frames < 16:
-            raise ValueError(f"Configured halo frames ({self.vae_halo_frames}) violates analytical receptive bound (>=16).")
+            raise ValueError(
+                f"Configured halo frames ({self.vae_halo_frames}) violates analytical receptive bound (>=16)."
+            )
+        if self.reference_audio_path and self.reference_audio_path.strip():
+            ref_p = Path(self.reference_audio_path.strip())
+            if not ref_p.is_absolute():
+                ref_p = DOODLE_ROOT / ref_p
+            if not ref_p.is_file():
+                raise FileNotFoundError(f"Reference audio file missing: {ref_p}")
 
     def save_preset(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -531,6 +599,7 @@ class GenerationResponse(BaseModel):
     semantic_token_count: int
     ode_steps_used: int
     ode_method_used: str
+    nar_text_only_used: bool = False
     cfg_scale_used: float
     effective_prompt: str
     effective_style: str
@@ -543,3 +612,10 @@ class GenerationResponse(BaseModel):
     crest_factor_db: float
     is_instrumental_used: bool = False
     instrumental_branch_used: str = "cues"
+    prefix_tokens_reused: int = 0
+    reference_frames_encoded: int = 0
+    swiss5_fast_tables_active: bool = True
+    abc_mean_entropy_bits: float = 0.0
+    abc_perplexity: float = 1.0
+    semantic_mean_entropy_bits: float = 0.0
+    semantic_perplexity: float = 1.0
