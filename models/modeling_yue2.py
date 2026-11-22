@@ -12,15 +12,15 @@ from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from models.modeling_vae import IEEE754FP32Guard, enforce_full_precision_reductions
+from refinery import (
+    PhysicsLab,
+    can_use_conductor_tensor,
+    contender_cast,
+    get_conductor_context,
+    warmup_conductor_gpu,
+)
 
 enforce_full_precision_reductions()
-
-try:
-    from refinery import PhysicsLab, contender_cast
-
-    _HAS_CONTENDER = True
-except ImportError:
-    _HAS_CONTENDER = False
 
 _FP8_DTYPES = tuple(
     dt
@@ -45,11 +45,15 @@ _E5M2_DTYPES = tuple(
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 _LM_HEAD_FP32_TILE_ROWS = 4096
 _NARROW_TILE_MAX_ROWS = 8192
+_DECODE_SCRATCH_MAX_TOKENS = 16
 
 _UNIT_SCALE_CACHE: Dict[Tuple[str, Optional[int]], torch.Tensor] = {}
 _L2_TILE_ROWS_CACHE: Dict[Tuple[str, Optional[int], int, int], int] = {}
 _FP32_TILE_WORKSPACE: Dict[Tuple[str, Optional[int], int], torch.Tensor] = {}
 _NARROW_TILE_WORKSPACE: Dict[
+    Tuple[str, Optional[int], torch.dtype, int], torch.Tensor
+] = {}
+_DECODE_SCRATCH_WORKSPACE: Dict[
     Tuple[str, Optional[int], torch.dtype, int], torch.Tensor
 ] = {}
 _MM_FP32_OUT_CACHE: Dict[Tuple[str, Optional[int], torch.dtype], bool] = {}
@@ -101,6 +105,7 @@ def clear_yue2_workspaces(
     if device is None:
         _FP32_TILE_WORKSPACE.clear()
         _NARROW_TILE_WORKSPACE.clear()
+        _DECODE_SCRATCH_WORKSPACE.clear()
         _UNIT_SCALE_CACHE.clear()
         return
     dev = torch.device(device) if isinstance(device, str) else device
@@ -118,6 +123,13 @@ def clear_yue2_workspaces(
         and (dev.index is None or buf.device.index == dev.index)
     ]:
         _NARROW_TILE_WORKSPACE.pop(nws_key, None)
+    for dws_key in [
+        k
+        for k, buf in _DECODE_SCRATCH_WORKSPACE.items()
+        if buf.device.type == dev.type
+        and (dev.index is None or buf.device.index == dev.index)
+    ]:
+        _DECODE_SCRATCH_WORKSPACE.pop(dws_key, None)
     for sc_key in [
         k
         for k, buf in _UNIT_SCALE_CACHE.items()
@@ -125,6 +137,47 @@ def clear_yue2_workspaces(
         and (dev.index is None or buf.device.index == dev.index)
     ]:
         _UNIT_SCALE_CACHE.pop(sc_key, None)
+
+
+def _get_decode_scratch(
+    device: torch.device,
+    dtype: torch.dtype,
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    num_heads: int,
+    head_dim: int,
+    intermediate_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_norm = batch_size * seq_len * hidden_size
+    n_q = batch_size * num_heads * seq_len * head_dim
+    n_mlp = batch_size * seq_len * intermediate_size
+    off_q = (n_norm + 15) & ~15
+    off_mlp = off_q + ((n_q + 15) & ~15)
+    total_elems = off_mlp + ((n_mlp + 15) & ~15)
+
+    dev_t, dev_i = _device_key(device)
+    key = (dev_t, dev_i, dtype, threading.get_ident())
+    buf = _DECODE_SCRATCH_WORKSPACE.get(key)
+    if (
+        buf is None
+        or buf.dtype != dtype
+        or _device_key(buf.device) != (dev_t, dev_i)
+        or buf.numel() < total_elems
+        or buf.is_inference()
+    ):
+        with torch.inference_mode(False):
+            buf = torch.empty((total_elems,), dtype=dtype, device=device)
+        if not _is_stream_capturing(device):
+            buf_t, buf_i = _device_key(buf.device)
+            _DECODE_SCRATCH_WORKSPACE[(buf_t, buf_i, dtype, key[3])] = buf
+
+    norm_buf = buf[:n_norm].view(batch_size, seq_len, hidden_size)
+    q_buf = buf[off_q : off_q + n_q].view(batch_size, num_heads, seq_len, head_dim)
+    mlp_act_buf = buf[off_mlp : off_mlp + n_mlp].view(
+        batch_size, seq_len, intermediate_size
+    )
+    return norm_buf, q_buf, mlp_act_buf
 
 
 def _get_unit_scale_fp32(device: torch.device) -> torch.Tensor:
@@ -244,6 +297,8 @@ def _prewarm_linear_capabilities(
 ) -> None:
     if device.type == "meta" or _is_stream_capturing(device):
         return
+    if device.type == "cuda":
+        warmup_conductor_gpu(device)
     if weight_dtype in (torch.bfloat16, torch.float16):
         _can_use_mm_fp32_out(device, weight_dtype)
     elif _FP8_DTYPES and weight_dtype in _FP8_DTYPES:
@@ -346,21 +401,38 @@ class _ContenderNarrowSTE(torch.autograd.Function):
 
 
 def _project_narrowing(
-    tensor: torch.Tensor, target_dtype: torch.dtype, *, phase_offset: int = 0
+    tensor: torch.Tensor,
+    target_dtype: torch.dtype,
+    *,
+    phase_offset: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if tensor.dtype == target_dtype:
+        if out is not None:
+            if tensor.numel() > 0:
+                out.copy_(tensor)
+            return out
         return tensor
-    if _HAS_CONTENDER and (
-        PhysicsLab.get_mantissa_width(tensor.dtype)
-        > PhysicsLab.get_mantissa_width(target_dtype)
+    if PhysicsLab.get_mantissa_width(tensor.dtype) > PhysicsLab.get_mantissa_width(
+        target_dtype
     ):
         if (
             torch.is_grad_enabled()
             and not torch.is_inference_mode_enabled()
             and tensor.requires_grad
         ):
+            if out is not None:
+                raise RuntimeError(
+                    "Preallocated output buffer (out=) cannot be used while autograd is tracking gradients."
+                )
             return _ContenderNarrowSTE.apply(tensor, target_dtype, int(phase_offset))
-        return contender_cast(tensor, target_dtype, phase_offset=int(phase_offset))
+        return contender_cast(
+            tensor, target_dtype, phase_offset=int(phase_offset), out=out
+        )
+    if out is not None:
+        if tensor.numel() > 0:
+            out.copy_(tensor)
+        return out
     return tensor.to(dtype=target_dtype)
 
 
@@ -995,13 +1067,41 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.phase_offset: int = int(phase_offset)
 
-    def forward_fp32(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_fp32(
+        self, x: torch.Tensor, *, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if (
+            x.ndim >= 1
+            and not self.weight.is_meta
+            and can_use_conductor_tensor(x.device, x.dtype, dst_dtype=torch.float32)
+        ):
+            ctx = get_conductor_context()
+            if ctx is not None:
+                return ctx.rms_norm_contender(
+                    x,
+                    self.weight,
+                    torch.float32,
+                    eps=self.eps,
+                    phase_offset=self.phase_offset,
+                    out=out,
+                )
+
         x_f32 = x if x.dtype == torch.float32 else x.float()
         w_f32 = (
             self.weight if self.weight.dtype == torch.float32 else self.weight.float()
         )
-        variance = x_f32.pow(2).mean(-1, keepdim=True)
-        return x_f32 * torch.rsqrt(variance + self.eps) * w_f32
+        if x_f32.device.type != "mps":
+            inv_rms = torch.rsqrt(
+                x_f32.to(dtype=torch.float64).pow(2).mean(-1, keepdim=True)
+                + float(self.eps)
+            ).to(dtype=torch.float32)
+        else:
+            inv_rms = torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + self.eps)
+        res = x_f32 * inv_rms * w_f32
+        if out is not None:
+            out.copy_(res)
+            return out
+        return res
 
     def forward_to_dtype(
         self,
@@ -1009,11 +1109,91 @@ class RMSNorm(nn.Module):
         target_dtype: torch.dtype,
         *,
         phase_offset: Optional[int] = None,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         eff_phase = self.phase_offset if phase_offset is None else int(phase_offset)
+        if (
+            x.ndim >= 1
+            and not self.weight.is_meta
+            and can_use_conductor_tensor(x.device, x.dtype, dst_dtype=target_dtype)
+        ):
+            ctx = get_conductor_context()
+            if ctx is not None:
+                return ctx.rms_norm_contender(
+                    x,
+                    self.weight,
+                    target_dtype,
+                    eps=self.eps,
+                    phase_offset=eff_phase,
+                    out=out,
+                )
         return _project_narrowing(
-            self.forward_fp32(x), target_dtype, phase_offset=eff_phase
+            self.forward_fp32(x), target_dtype, phase_offset=eff_phase, out=out
         )
+
+    def forward_residual_to_dtype(
+        self,
+        residual: torch.Tensor,
+        delta: torch.Tensor,
+        target_dtype: torch.dtype,
+        *,
+        phase_offset: Optional[int] = None,
+        res_out: Optional[torch.Tensor] = None,
+        norm_out: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        eff_phase = self.phase_offset if phase_offset is None else int(phase_offset)
+        if (
+            residual.ndim >= 1
+            and residual.shape == delta.shape
+            and residual.dtype != torch.float64
+            and delta.dtype != torch.float64
+            and not self.weight.is_meta
+            and can_use_conductor_tensor(
+                residual.device, torch.float32, dst_dtype=target_dtype
+            )
+        ):
+            ctx = get_conductor_context()
+            if ctx is not None:
+                return ctx.residual_rms_norm_contender(
+                    residual,
+                    delta,
+                    self.weight,
+                    target_dtype,
+                    eps=self.eps,
+                    phase_offset=eff_phase,
+                    res_out=res_out,
+                    norm_out=norm_out,
+                )
+
+        grad_active = (
+            torch.is_grad_enabled()
+            and not torch.is_inference_mode_enabled()
+            and (
+                residual.requires_grad
+                or delta.requires_grad
+                or self.weight.requires_grad
+            )
+        )
+        if (res_out is not None or norm_out is not None) and (
+            grad_active
+            or (res_out is not None and res_out.requires_grad)
+            or (norm_out is not None and norm_out.requires_grad)
+        ):
+            raise RuntimeError(
+                "Preallocated output buffers (res_out=/norm_out=) cannot be used while autograd is tracking gradients."
+            )
+
+        res_f32 = residual if residual.dtype == torch.float32 else residual.float()
+        del_f32 = delta if delta.dtype == torch.float32 else delta.float()
+        if res_out is not None:
+            torch.add(res_f32, del_f32, out=res_out)
+            sum_f32 = res_out
+        else:
+            sum_f32 = res_f32 + del_f32
+        norm_t = self.forward_to_dtype(
+            sum_f32, target_dtype, phase_offset=eff_phase, out=norm_out
+        )
+        return sum_f32, norm_t
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_to_dtype(x, x.dtype)
@@ -1296,18 +1476,6 @@ def _apply_rotary_fp32(
     return torch.cat([rot_1, rot_2], dim=-1)
 
 
-def _apply_rotary(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    *,
-    phase_offset: int = 0,
-) -> torch.Tensor:
-    x_f32 = x if x.dtype == torch.float32 else x.float()
-    out_f32 = _apply_rotary_fp32(x_f32, cos, sin)
-    return _project_narrowing(out_f32, x.dtype, phase_offset=phase_offset)
-
-
 class Attention(nn.Module):
     def __init__(self, config: YuE2Config, *, phase_base: int = 1):
         super().__init__()
@@ -1521,22 +1689,61 @@ class Attention(nn.Module):
         )
 
     def project_qkv(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        layout_bhsd: bool = False,
+        q_out: Optional[torch.Tensor] = None,
+        k_out: Optional[torch.Tensor] = None,
+        v_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, t, _ = x.shape
         target_dt = x.dtype
+        use_conductor = (
+            self.q_norm.eps == self.k_norm.eps
+            and not self.q_norm.weight.is_meta
+            and not self.k_norm.weight.is_meta
+            and can_use_conductor_tensor(x.device, torch.float32, dst_dtype=target_dt)
+        )
+
         if self._can_use_fused_qkv():
             assert self._qkv_weight is not None
-            q_out = self.num_heads * self.head_dim
-            kv_out = self.num_kv_heads * self.head_dim
             qkv_f32 = _dispatch_quant_safe_linear_fp32(
                 x, self._qkv_weight, None, self._qkv_col_cache
             )
-            q_raw_f32 = qkv_f32[..., :q_out].view(b, t, self.num_heads, self.head_dim)
-            k_raw_f32 = qkv_f32[..., q_out : q_out + kv_out].view(
+            if use_conductor:
+                ctx = get_conductor_context()
+                if ctx is not None:
+                    return ctx.qk_norm_rope_packed_contender(
+                        qkv_f32,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        cos,
+                        sin,
+                        self.num_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        target_dt,
+                        eps=self.q_norm.eps,
+                        phase_q=self._phase_q,
+                        phase_k=self._phase_k,
+                        phase_v=self._phase_v,
+                        layout_bhsd=layout_bhsd,
+                        q_out=q_out,
+                        k_out=k_out,
+                        v_out=v_out,
+                    )
+            q_out_dim = self.num_heads * self.head_dim
+            kv_out_dim = self.num_kv_heads * self.head_dim
+            q_raw_f32 = qkv_f32[..., :q_out_dim].view(
+                b, t, self.num_heads, self.head_dim
+            )
+            k_raw_f32 = qkv_f32[..., q_out_dim : q_out_dim + kv_out_dim].view(
                 b, t, self.num_kv_heads, self.head_dim
             )
-            v_raw_f32 = qkv_f32[..., q_out + kv_out :].view(
+            v_raw_f32 = qkv_f32[..., q_out_dim + kv_out_dim :].view(
                 b, t, self.num_kv_heads, self.head_dim
             )
         else:
@@ -1549,6 +1756,47 @@ class Attention(nn.Module):
             v_raw_f32 = self.v_proj.forward_fp32(x).view(
                 b, t, self.num_kv_heads, self.head_dim
             )
+            if use_conductor:
+                ctx = get_conductor_context()
+                if ctx is not None:
+                    q_b, k_b, v_b = ctx.qk_norm_rope_contender(
+                        q_raw_f32,
+                        k_raw_f32,
+                        v_raw_f32,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        cos,
+                        sin,
+                        target_dt,
+                        eps=self.q_norm.eps,
+                        phase_q=self._phase_q,
+                        phase_k=self._phase_k,
+                        phase_v=self._phase_v,
+                        q_out=None if layout_bhsd else q_out,
+                        k_out=None if layout_bhsd else k_out,
+                        v_out=None if layout_bhsd else v_out,
+                    )
+                    if not layout_bhsd:
+                        return q_b, k_b, v_b
+                    q_t = q_b.transpose(1, 2)
+                    k_t = k_b.transpose(1, 2)
+                    v_t = v_b.transpose(1, 2)
+                    if q_out is not None:
+                        q_out.copy_(q_t)
+                        q_t = q_out
+                    else:
+                        q_t = q_t.contiguous()
+                    if k_out is not None:
+                        k_out.copy_(k_t)
+                        k_t = k_out
+                    else:
+                        k_t = k_t.contiguous()
+                    if v_out is not None:
+                        v_out.copy_(v_t)
+                        v_t = v_out
+                    else:
+                        v_t = v_t.contiguous()
+                    return q_t, k_t, v_t
 
         q_f32 = self.q_norm.forward_fp32(q_raw_f32)
         k_f32 = self.k_norm.forward_fp32(k_raw_f32)
@@ -1556,11 +1804,109 @@ class Attention(nn.Module):
         q_rot_f32 = _apply_rotary_fp32(q_f32, rc, rs)
         k_rot_f32 = _apply_rotary_fp32(k_f32, rc, rs)
 
-        q = _project_narrowing(q_rot_f32, target_dt, phase_offset=self._phase_q)
-        k = _project_narrowing(k_rot_f32, target_dt, phase_offset=self._phase_k)
-        v_proj = _project_narrowing(v_raw_f32, target_dt, phase_offset=self._phase_v)
+        q = _project_narrowing(
+            q_rot_f32,
+            target_dt,
+            phase_offset=self._phase_q,
+            out=None if layout_bhsd else q_out,
+        )
+        k = _project_narrowing(
+            k_rot_f32,
+            target_dt,
+            phase_offset=self._phase_k,
+            out=None if layout_bhsd else k_out,
+        )
+        v_proj = _project_narrowing(
+            v_raw_f32,
+            target_dt,
+            phase_offset=self._phase_v,
+            out=None if layout_bhsd else v_out,
+        )
+        if layout_bhsd:
+            q_t = q.transpose(1, 2)
+            k_t = k.transpose(1, 2)
+            v_t = v_proj.transpose(1, 2)
+            if q_out is not None:
+                q_out.copy_(q_t)
+                q_t = q_out
+            else:
+                q_t = q_t.contiguous()
+            if k_out is not None:
+                k_out.copy_(k_t)
+                k_t = k_out
+            else:
+                k_t = k_t.contiguous()
+            if v_out is not None:
+                v_out.copy_(v_t)
+                v_t = v_out
+            else:
+                v_t = v_t.contiguous()
+            return q_t, k_t, v_t
         v = v_proj if v_proj.is_contiguous() else v_proj.contiguous()
         return q, k, v
+
+    def project_qkv_into_kv_cache(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        kv_seq_offset: int,
+        *,
+        q_out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        t = int(x.shape[1])
+        target_dt = x.dtype
+        off = int(kv_seq_offset)
+        use_strided_conductor = (
+            not torch.is_grad_enabled()
+            and self.q_norm.eps == self.k_norm.eps
+            and not self.q_norm.weight.is_meta
+            and not self.k_norm.weight.is_meta
+            and k_cache.dtype == target_dt
+            and v_cache.dtype == target_dt
+            and k_cache.device == x.device
+            and v_cache.device == x.device
+            and k_cache.is_contiguous()
+            and v_cache.is_contiguous()
+            and self._can_use_fused_qkv()
+            and can_use_conductor_tensor(x.device, torch.float32, dst_dtype=target_dt)
+        )
+        if use_strided_conductor:
+            assert self._qkv_weight is not None
+            ctx = get_conductor_context()
+            if ctx is not None:
+                qkv_f32 = _dispatch_quant_safe_linear_fp32(
+                    x, self._qkv_weight, None, self._qkv_col_cache
+                )
+                q, _, _ = ctx.qk_norm_rope_packed_strided_contender(
+                    qkv_f32,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos,
+                    sin,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    k_cache,
+                    v_cache,
+                    kv_seq_offset=off,
+                    dst_dtype=target_dt,
+                    eps=self.q_norm.eps,
+                    phase_q=self._phase_q,
+                    phase_k=self._phase_k,
+                    phase_v=self._phase_v,
+                    q_out=q_out,
+                )
+                return q
+
+        q, k, v = self.project_qkv(x, cos, sin, layout_bhsd=True, q_out=q_out)
+        k_cast = _project_narrowing(k, k_cache.dtype, phase_offset=self._phase_k)
+        v_cast = _project_narrowing(v, v_cache.dtype, phase_offset=self._phase_v)
+        k_cache[:, :, off : off + t, :].copy_(k_cast)
+        v_cache[:, :, off : off + t, :].copy_(v_cast)
+        return q
 
     def forward_fp32(
         self,
@@ -1571,14 +1917,32 @@ class Attention(nn.Module):
         layer_idx: int = 0,
         attention_mask: Optional[torch.Tensor] = None,
         cache_position: Optional[torch.Tensor] = None,
+        *,
+        q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         b, t, _ = x.shape
-        q, k, v = self.project_qkv(x, cos, sin)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        if past_key_value is not None:
-            k, v = past_key_value.update(
-                k, v, layer_idx, {"cache_position": cache_position}
+        if isinstance(past_key_value, StaticKVCache) and not torch.is_grad_enabled():
+            prep = past_key_value.prepare_contiguous_write(
+                layer_idx, t, b, cache_position
             )
+            if prep is not None:
+                k_buf, v_buf, kv_off, eff_end = prep
+                q = self.project_qkv_into_kv_cache(
+                    x, cos, sin, k_buf, v_buf, kv_off, q_out=q_out
+                )
+                k, v = past_key_value.commit_contiguous_write(layer_idx, eff_end)
+            else:
+                q, k, v = self.project_qkv(x, cos, sin, layout_bhsd=True, q_out=q_out)
+                k, v = past_key_value.update(
+                    k, v, layer_idx, {"cache_position": cache_position}
+                )
+        else:
+            q, k, v = self.project_qkv(x, cos, sin, layout_bhsd=True, q_out=q_out)
+            if past_key_value is not None:
+                k, v = past_key_value.update(
+                    k, v, layer_idx, {"cache_position": cache_position}
+                )
+
         if attention_mask is not None:
             mask_slice = attention_mask[..., : k.shape[2]]
             if mask_slice.dtype != torch.bool and mask_slice.dtype != q.dtype:
@@ -1777,12 +2141,29 @@ class MLP(nn.Module):
             _tensor_version(wu),
         )
 
-    def forward_fp32(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_fp32(
+        self, x: torch.Tensor, *, act_out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        use_conductor = can_use_conductor_tensor(
+            x.device, torch.float32, dst_dtype=x.dtype
+        )
+
         if self._can_use_fused_gate_up():
             assert self._gate_up_weight is not None
             gu_f32 = _dispatch_quant_safe_linear_fp32(
                 x, self._gate_up_weight, None, self._gate_up_col_cache
             )
+            if use_conductor:
+                ctx = get_conductor_context()
+                if ctx is not None:
+                    act = ctx.swiglu_packed_contender(
+                        gu_f32,
+                        x.dtype,
+                        phase_offset=self._phase_act,
+                        out=act_out,
+                    )
+                    return self.down_proj.forward_fp32(act)
+
             inter = gu_f32.shape[-1] // 2
             gate_f32 = gu_f32[..., :inter]
             up_f32 = gu_f32[..., inter:]
@@ -1790,27 +2171,43 @@ class MLP(nn.Module):
                 F.silu(gate_f32, inplace=True)
                 gate_f32.mul_(up_f32)
                 act = _project_narrowing(
-                    gate_f32, x.dtype, phase_offset=self._phase_act
+                    gate_f32, x.dtype, phase_offset=self._phase_act, out=act_out
                 )
                 return self.down_proj.forward_fp32(act)
             prod = F.silu(gate_f32) * up_f32
             return self.down_proj.forward_fp32(
-                _project_narrowing(prod, x.dtype, phase_offset=self._phase_act)
+                _project_narrowing(
+                    prod, x.dtype, phase_offset=self._phase_act, out=act_out
+                )
             )
 
         gate_f32 = self.gate_proj.forward_fp32(x)
         up_f32 = self.up_proj.forward_fp32(x)
+        if use_conductor:
+            ctx = get_conductor_context()
+            if ctx is not None:
+                act = ctx.swiglu_contender(
+                    gate_f32,
+                    up_f32,
+                    x.dtype,
+                    phase_offset=self._phase_act,
+                    out=act_out,
+                )
+                return self.down_proj.forward_fp32(act)
+
         if not torch.is_grad_enabled():
             F.silu(gate_f32, inplace=True)
             gate_f32.mul_(up_f32)
             act = _project_narrowing(
-                gate_f32, x.dtype, phase_offset=self._phase_act
+                gate_f32, x.dtype, phase_offset=self._phase_act, out=act_out
             )
             return self.down_proj.forward_fp32(act)
 
         prod = F.silu(gate_f32) * up_f32
         return self.down_proj.forward_fp32(
-            _project_narrowing(prod, x.dtype, phase_offset=self._phase_act)
+            _project_narrowing(
+                prod, x.dtype, phase_offset=self._phase_act, out=act_out
+            )
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1841,6 +2238,55 @@ class DecoderLayer(nn.Module):
         )
         self.nar_mlp = MLP(config, phase_base=(base + 14) & 63)
 
+    def forward_fused_step(
+        self,
+        x_res_f32: torch.Tensor,
+        norm_in: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        past_key_value: Optional[DynamicCache] = None,
+        layer_idx: int = 0,
+        attention_mask: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.Tensor] = None,
+        *,
+        act_dt: torch.dtype,
+        next_input_layernorm: Optional[RMSNorm] = None,
+        norm_buf: Optional[torch.Tensor] = None,
+        q_buf: Optional[torch.Tensor] = None,
+        mlp_act_buf: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        h_f32 = self.self_attn.forward_fp32(
+            norm_in,
+            cos,
+            sin,
+            past_key_value,
+            layer_idx,
+            attention_mask,
+            cache_position,
+            q_out=q_buf,
+        )
+        x_res_f32, norm_mlp = (
+            self.post_attention_layernorm.forward_residual_to_dtype(
+                x_res_f32,
+                h_f32,
+                act_dt,
+                res_out=x_res_f32,
+                norm_out=norm_buf,
+            )
+        )
+        m_f32 = self.mlp.forward_fp32(norm_mlp, act_out=mlp_act_buf)
+        if next_input_layernorm is not None:
+            x_res_f32, next_norm = next_input_layernorm.forward_residual_to_dtype(
+                x_res_f32,
+                m_f32,
+                act_dt,
+                res_out=x_res_f32,
+                norm_out=norm_buf,
+            )
+            return x_res_f32, next_norm
+        x_res_f32.add_(m_f32)
+        return x_res_f32, None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1859,21 +2305,24 @@ class DecoderLayer(nn.Module):
             _inplace_residual or x.dtype != torch.float32
         )
         x_res_f32 = x if x.dtype == torch.float32 else x.float()
+        if can_inplace and not x_res_f32.is_contiguous():
+            x_res_f32 = x_res_f32.contiguous()
 
         if ar_mask is not None:
             mask_3d = ar_mask.unsqueeze(-1)
-            mask_4d = ar_mask.unsqueeze(-1).unsqueeze(-1)
+            mask_4d = ar_mask[:, None, :, None]
             ln_ar = self.input_layernorm.forward_to_dtype(x_res_f32, act_dt)
             ln_nar = self.nar_input_layernorm.forward_to_dtype(x_res_f32, act_dt)
-            q_ar, k_ar, v_ar = self.self_attn.project_qkv(ln_ar, cos, sin)
-            q_nar, k_nar, v_nar = self.nar_self_attn.project_qkv(ln_nar, cos, sin)
+            q_ar, k_ar, v_ar = self.self_attn.project_qkv(
+                ln_ar, cos, sin, layout_bhsd=True
+            )
+            q_nar, k_nar, v_nar = self.nar_self_attn.project_qkv(
+                ln_nar, cos, sin, layout_bhsd=True
+            )
             query = torch.where(mask_4d, q_ar, q_nar)
             key = torch.where(mask_4d, k_ar, k_nar)
             value = torch.where(mask_4d, v_ar, v_nar)
             b, s = x_res_f32.shape[:2]
-            query = query.transpose(1, 2)
-            key = key.transpose(1, 2)
-            value = value.transpose(1, 2)
             if (
                 attention_mask is not None
                 and attention_mask.dtype != torch.bool
@@ -1903,10 +2352,15 @@ class DecoderLayer(nn.Module):
                 attention_mask,
                 cache_position,
             )
-            x_res_f32 = x_res_f32.add_(h_f32) if can_inplace else (x_res_f32 + h_f32)
-            m_f32 = self.mlp.forward_fp32(
-                self.post_attention_layernorm.forward_to_dtype(x_res_f32, act_dt)
+            x_res_f32, norm_mlp = (
+                self.post_attention_layernorm.forward_residual_to_dtype(
+                    x_res_f32,
+                    h_f32,
+                    act_dt,
+                    res_out=x_res_f32 if can_inplace else None,
+                )
             )
+            m_f32 = self.mlp.forward_fp32(norm_mlp)
 
         x_res_f32 = x_res_f32.add_(m_f32) if can_inplace else (x_res_f32 + m_f32)
         return _project_narrowing(x_res_f32, x.dtype, phase_offset=self._phase_res)
@@ -1976,9 +2430,11 @@ class TimestepEmbedder(nn.Module):
                     * torch.arange(half, device="cpu", dtype=torch.float64)
                     / float(half)
                 )
-                self._freqs_cache = freqs_cpu_64.to(
-                    dtype=torch.float32
-                ).to(device=t.device).contiguous()
+                self._freqs_cache = (
+                    freqs_cpu_64.to(dtype=torch.float32)
+                    .to(device=t.device)
+                    .contiguous()
+                )
                 self._freqs_cache_f64 = (
                     freqs_cpu_64.to(device=t.device, dtype=torch.float64).contiguous()
                     if t.device.type != "mps"
@@ -2143,6 +2599,65 @@ class StaticKVCache:
         self._seen_tokens = retained
         self._cached_pos_key = None
 
+    def prepare_contiguous_write(
+        self,
+        layer_idx: int,
+        seq_len: int,
+        batch_size: int,
+        cache_position: Optional[torch.Tensor] = None,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, int, int]]:
+        if batch_size != self.batch_size or seq_len <= 0:
+            return None
+        k_buf = self.key_cache[layer_idx]
+        v_buf = self.value_cache[layer_idx]
+        if not (k_buf.is_contiguous() and v_buf.is_contiguous()):
+            return None
+
+        if cache_position is not None:
+            if cache_position.numel() != seq_len:
+                return None
+            pos_key = (cache_position.data_ptr(), seq_len)
+            if self._cached_pos_key != pos_key:
+                bounds_cpu = torch.stack(
+                    (cache_position[0], cache_position[-1])
+                ).to(device="cpu", dtype=torch.int64)
+                self._cached_pos_bounds = (
+                    int(bounds_cpu[0]),
+                    int(bounds_cpu[1]),
+                )
+                self._cached_pos_key = pos_key
+            pos0, pos_last = self._cached_pos_bounds
+            if pos_last - pos0 != seq_len - 1 or pos0 < 0:
+                return None
+            end = pos_last + 1
+            if end > self.max_seq_len:
+                raise ValueError(
+                    f"StaticKVCache capacity limit {self.max_seq_len} exceeded by request ({end})."
+                )
+            if pos0 > self._seen_tokens:
+                k_buf[:, :, self._seen_tokens : pos0].zero_()
+                v_buf[:, :, self._seen_tokens : pos0].zero_()
+            return k_buf, v_buf, pos0, max(self._seen_tokens, end)
+
+        pos = self._seen_tokens
+        end = pos + seq_len
+        if end > self.max_seq_len:
+            raise ValueError(
+                f"StaticKVCache capacity limit {self.max_seq_len} exceeded by request ({end})."
+            )
+        return k_buf, v_buf, pos, end
+
+    def commit_contiguous_write(
+        self, layer_idx: int, effective_end: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if layer_idx == self.num_layers - 1:
+            self._seen_tokens = effective_end
+            self._cached_pos_key = None
+        return (
+            self.key_cache[layer_idx][:, :, :effective_end],
+            self.value_cache[layer_idx][:, :, :effective_end],
+        )
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -2241,6 +2756,7 @@ class StaticKVCache:
 class Backbone(nn.Module):
     def __init__(self, config: YuE2Config):
         super().__init__()
+        self.config = config
         with torch.inference_mode(False):
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
@@ -2316,23 +2832,76 @@ class Backbone(nn.Module):
             x_f32 = raw_x.clone()
         else:
             x_f32 = raw_x
+        if inplace_res and not x_f32.is_contiguous():
+            x_f32 = x_f32.contiguous()
+
         cos, sin = self.rotary_emb(position_ids, seq_len_hint=seq_len_hint)
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
+
+        n_layers = len(self.layers)
+        kv_arg = past_key_values if use_cache else None
+
         with IEEE754FP32Guard():
-            for i, layer in enumerate(self.layers):
-                x_f32 = layer(
-                    x_f32,
-                    cos,
-                    sin,
-                    past_key_values if use_cache else None,
-                    layer_idx=i,
-                    attention_mask=attention_mask,
-                    ar_mask=ar_mask,
-                    cache_position=cache_position,
-                    compute_dtype=act_dt,
-                    _inplace_residual=inplace_res,
+            if (
+                inplace_res
+                and ar_mask is None
+                and n_layers > 0
+                and not x_f32.is_meta
+            ):
+                b_sz, t_sz = int(x_f32.shape[0]), int(x_f32.shape[1])
+                norm_buf: Optional[torch.Tensor] = None
+                q_buf: Optional[torch.Tensor] = None
+                mlp_act_buf: Optional[torch.Tensor] = None
+                if b_sz * t_sz <= _DECODE_SCRATCH_MAX_TOKENS and b_sz > 0 and t_sz > 0:
+                    norm_buf, q_buf, mlp_act_buf = _get_decode_scratch(
+                        x_f32.device,
+                        act_dt,
+                        b_sz,
+                        t_sz,
+                        self.config.hidden_size,
+                        self.config.num_attention_heads,
+                        self.config.head_dim,
+                        self.config.intermediate_size,
+                    )
+                norm_in = self.layers[0].input_layernorm.forward_to_dtype(
+                    x_f32, act_dt, out=norm_buf
                 )
+                for i, layer in enumerate(self.layers):
+                    next_ln = (
+                        self.layers[i + 1].input_layernorm
+                        if (i + 1 < n_layers)
+                        else None
+                    )
+                    x_f32, norm_in = layer.forward_fused_step(
+                        x_f32,
+                        norm_in,
+                        cos,
+                        sin,
+                        kv_arg,
+                        layer_idx=i,
+                        attention_mask=attention_mask,
+                        cache_position=cache_position,
+                        act_dt=act_dt,
+                        next_input_layernorm=next_ln,
+                        norm_buf=norm_buf,
+                        q_buf=q_buf,
+                        mlp_act_buf=mlp_act_buf,
+                    )
+            else:
+                for i, layer in enumerate(self.layers):
+                    x_f32 = layer(
+                        x_f32,
+                        cos,
+                        sin,
+                        kv_arg,
+                        layer_idx=i,
+                        attention_mask=attention_mask,
+                        ar_mask=ar_mask,
+                        cache_position=cache_position,
+                        compute_dtype=act_dt,
+                        _inplace_residual=inplace_res,
+                    )
         return x_f32, past_key_values
 
     def forward(
@@ -2356,13 +2925,15 @@ class Backbone(nn.Module):
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
         )
-        out_f32 = self.norm.forward_fp32(x_f32)
         target_dt = (
             inputs_embeds.dtype
             if (inputs_embeds is not None and inputs_embeds.dtype != torch.float32)
             else self.trunk_dtype
         )
-        return _project_narrowing(out_f32, target_dt, phase_offset=63), past_key_values
+        return (
+            self.norm.forward_to_dtype(x_f32, target_dt, phase_offset=63),
+            past_key_values,
+        )
 
 
 class YuE2PreTrainedModel(PreTrainedModel):
@@ -2438,6 +3009,8 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
                 _prewarm_linear_capabilities(
                     head_mod.weight.device, head_mod.weight.dtype
                 )
+        if not self.lm_head.weight.is_meta:
+            warmup_conductor_gpu(self.lm_head.weight.device)
 
     def unbind_fused_projections(self) -> None:
         self.model.unbind_fused_projections()
@@ -2463,12 +3036,7 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, new_embeddings: nn.Module) -> None:
         self.lm_head = new_embeddings
 
-    def _shift_t_value(
-        self,
-        t_value: float,
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
+    def shift_t_scalar(self, t_value: float) -> float:
         t_val = float(t_value)
         if t_val >= 0.0:
             t_sig = 1.0 / (1.0 + math.exp(-t_val))
@@ -2476,15 +3044,34 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
             et = math.exp(t_val)
             t_sig = et / (1.0 + et)
         shift = float(self.config.timestep_shift)
-        shifted = shift * t_sig / (1.0 + (shift - 1.0) * t_sig)
-        return torch.full((), shifted, dtype=dtype, device=device)
+        return shift * t_sig / (1.0 + (shift - 1.0) * t_sig)
+
+    def _shift_t_value(
+        self,
+        t_value: float,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        return torch.full(
+            (), self.shift_t_scalar(t_value), dtype=dtype, device=device
+        )
 
     def project_latent_to_trunk_fp32(
-        self, x_nar_f32: torch.Tensor, raw_t: float, pos_emb_f32: torch.Tensor
+        self,
+        x_nar_f32: torch.Tensor,
+        t_input: Union[float, torch.Tensor],
+        pos_emb_f32: torch.Tensor,
     ) -> torch.Tensor:
         device = x_nar_f32.device
         t_dt = torch.float64 if device.type != "mps" else torch.float32
-        t_shifted = self._shift_t_value(raw_t, device, t_dt).reshape(1)
+        if isinstance(t_input, torch.Tensor):
+            t_shifted = (
+                t_input
+                if (t_input.device == device and t_input.dtype == t_dt)
+                else t_input.to(device=device, dtype=t_dt)
+            ).reshape(1)
+        else:
+            t_shifted = self._shift_t_value(t_input, device, t_dt).reshape(1)
         x_in = x_nar_f32 if x_nar_f32.dtype == torch.float32 else x_nar_f32.float()
         with IEEE754FP32Guard(), torch.autocast(
             device_type=device.type, enabled=False
@@ -2497,15 +3084,6 @@ class YuE2ForCausalLM(YuE2PreTrainedModel, GenerationMixin):
             else:
                 h_f32 = h_f32 + time_vec + pos_emb_f32
         return h_f32
-
-    def project_latent_to_trunk(
-        self, x_nar_f32: torch.Tensor, raw_t: float, pos_emb_f32: torch.Tensor
-    ) -> torch.Tensor:
-        return _project_narrowing(
-            self.project_latent_to_trunk_fp32(x_nar_f32, raw_t, pos_emb_f32),
-            self.trunk_dtype,
-            phase_offset=58,
-        )
 
     def project_trunk_to_velocity_fp32(
         self, prenorm_hidden: torch.Tensor

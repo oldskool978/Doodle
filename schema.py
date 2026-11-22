@@ -619,3 +619,10 @@ class GenerationResponse(BaseModel):
     abc_perplexity: float = 1.0
     semantic_mean_entropy_bits: float = 0.0
     semantic_perplexity: float = 1.0
+    conductor_active: bool = False
+    conductor_abi_version: int = 0
+    conductor_gpu_backend: str = "NONE"
+    conductor_fast_lut_active: bool = False
+    measured_bpm: Optional[float] = None
+    abc_bar_count: int = 0
+    abc_bpm: Optional[float] = None

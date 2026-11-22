@@ -19,6 +19,7 @@ sys.modules["torchvision.io"] = None
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 
 from engine import MusicEngine
+from refinery import get_conductor_context, get_conductor_info
 from schema import (
     DEFAULT_PRESET_FILENAME,
     GenerationRequest,
@@ -167,6 +168,32 @@ def _instantiate_engine(
     return MusicEngine(**kwargs)
 
 
+def _export_abc_to_midi_file(
+    abc_text: str,
+    dest_path: str,
+    *,
+    override_bpm: float = 0.0,
+) -> Tuple[Path, int, Dict[str, Any]]:
+    cnd_ctx = get_conductor_context()
+    if cnd_ctx is None:
+        raise RuntimeError(
+            "Native Conductor ABI v3 runtime is unavailable for SMF1 MIDI export."
+        )
+    target = Path(dest_path)
+    if target.suffix.lower() not in (".mid", ".midi"):
+        target = target.with_suffix(".mid")
+    if not target.is_absolute():
+        target = ROOT_DIR / target
+    smf_bytes, smf_meta = cnd_ctx.abc_to_midi_smf1(
+        abc_text, override_bpm=float(override_bpm)
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f"{target.name}.tmp")
+    tmp_path.write_bytes(smf_bytes)
+    tmp_path.replace(target)
+    return target, len(smf_bytes), smf_meta
+
+
 def create_default_harness_request() -> GenerationRequest:
     defaults = get_active_engine_defaults()
     default_vocal = "Silky male tenor lead vocal, dynamic chest-to-falsetto transitions, intricate melismatic ad-libs, stacked 4-part harmonies."
@@ -226,6 +253,16 @@ def print_telemetry(
         if resp.swiss5_fast_tables_active
         else "FALLBACK HEAP TABLE"
     )
+    abi_tag = (
+        f"v{resp.conductor_abi_version}"
+        if resp.conductor_abi_version > 0
+        else "v?"
+    )
+    cnd_label = (
+        f"NATIVE ABI {abi_tag} (GPU={resp.conductor_gpu_backend} | LUT001={'MMAP' if resp.conductor_fast_lut_active else 'MEM'})"
+        if resp.conductor_active
+        else "FALLBACK (PURE ATEN)"
+    )
     print("\n" + "=" * 84)
     print("                        DOODLE ACOUSTIC TELEMETRY REPORT")
     print("=" * 84)
@@ -244,6 +281,7 @@ def print_telemetry(
     print(
         f"Tokenizer Substrate:   {swiss_label} | AVX2 KV Reused: {resp.prefix_tokens_reused} tokens"
     )
+    print(f"Conductor Kernels:     {cnd_label}")
     print(
         f"Modality Mode:         {'INSTRUMENTAL' if resp.is_instrumental_used else 'VOCAL SONG'}"
     )
@@ -252,6 +290,11 @@ def print_telemetry(
     print(
         f"Chain-of-Thought Plan: {resp.cot_mode_used.upper()} ({resp.abc_token_count} score tokens | H={resp.abc_mean_entropy_bits:.3f} bits, PPL={resp.abc_perplexity:.2f})"
     )
+    if resp.abc_bar_count > 0 or resp.abc_bpm is not None:
+        abc_bpm_str = f"{resp.abc_bpm:.2f} BPM" if resp.abc_bpm is not None else "n/a"
+        print(
+            f"Symbolic Score Grid:   {resp.abc_bar_count} bars | Header Tempo: {abc_bpm_str}"
+        )
     print(
         f"Semantic Acoustic LM:  {resp.semantic_token_count} discrete codec frames (H={resp.semantic_mean_entropy_bits:.3f} bits, PPL={resp.semantic_perplexity:.2f})"
     )
@@ -271,6 +314,14 @@ def print_telemetry(
     )
     print(f"Signal Dynamics (RMS): {resp.rms_dbfs:.4f} dBFS")
     print(f"Acoustic Crest Factor: {resp.crest_factor_db:.4f} dB")
+    if resp.measured_bpm is not None:
+        if req is not None and req.bpm and req.bpm > 0:
+            delta_bpm = resp.measured_bpm - float(req.bpm)
+            print(
+                f"Measured Acoustic BPM: {resp.measured_bpm:.2f} BPM (Target: {req.bpm} BPM, delta={delta_bpm:+.2f})"
+            )
+        else:
+            print(f"Measured Acoustic BPM: {resp.measured_bpm:.2f} BPM")
     if resp.abc_notation:
         print("-" * 84)
         print("Generated / Ingested ABC Notation Excerpt:")
@@ -381,11 +432,16 @@ def run_permutation_matrix(
         try:
             resp = engine.synthesize(req)
             elapsed = time.perf_counter() - t0
+            bpm_note = (
+                f" | BPM: {resp.measured_bpm:.1f}"
+                if resp.measured_bpm is not None
+                else ""
+            )
             print(
                 f"  [+] Success | Latency: {elapsed:.2f}s | RTF: {resp.real_time_factor:.2f}x | "
                 f"H_sem: {resp.semantic_mean_entropy_bits:.2f}b | "
                 f"Peak: {resp.peak_dbfs:.2f} dBFS | RMS: {resp.rms_dbfs:.2f} dBFS | "
-                f"KV Reused: {resp.prefix_tokens_reused} tok"
+                f"KV Reused: {resp.prefix_tokens_reused} tok{bpm_note}"
             )
             results.append(
                 (
@@ -437,10 +493,16 @@ def display_menu(
         if has_custom_default_preset()
         else "Discovered Optimal Baseline (Hardcoded)"
     )
+    cnd_info = get_conductor_info()
+    cnd_tag = (
+        f"CND=v{cnd_info['abi_version']}/{cnd_info['gpu_backend']}"
+        if cnd_info["active"]
+        else "CND=OFF"
+    )
     engine_tag = (
-        f"LOADED ({engine.device} | SWISS5={'ON' if engine.tokenizer.has_fast_tables else 'OFF'})"
+        f"LOADED ({engine.device} | SWISS5={'ON' if engine.tokenizer.has_fast_tables else 'OFF'} | {cnd_tag})"
         if engine is not None
-        else "LAZY STANDBY (Zero VRAM Allocated)"
+        else f"LAZY STANDBY (Zero VRAM Allocated | {cnd_tag})"
     )
     lead_header = "Acoustic Lead:" if is_inst else "Vocal Profile:"
     lead_content = (
@@ -537,7 +599,7 @@ def display_menu(
     print(
         f" [E]  Edit Active Sheet:      {lyrics_status} ({'Instrumental Cues' if (is_inst and req.instrumental_branch == 'cues') else 'Vocal Lyrics'})"
     )
-    print(f" [A]  Ingest ABC Lead Sheet:  {abc_status}")
+    print(f" [A]  Ingest / Export ABC:    {abc_status}")
     print(f" [R]  Reference Audio Latent: {ref_status}")
     print(" --- STAGE 1 AUTOREGRESSIVE MoT SAMPLING ---")
     print(
@@ -609,7 +671,7 @@ def edit_multiline_sheet(current_text: str, is_inst: bool) -> str:
 
 def prompt_abc_menu(req: GenerationRequest, last_abc: Optional[str] = None) -> None:
     print("\n" + "-" * 76)
-    print("                   ABC NOTATION / SHEET MUSIC INGESTION")
+    print("              ABC NOTATION / SHEET MUSIC INGESTION & MIDI EXPORT")
     print("-" * 76)
     curr_status = (
         f"{len(req.abc.splitlines())} lines loaded"
@@ -622,6 +684,7 @@ def prompt_abc_menu(req: GenerationRequest, last_abc: Optional[str] = None) -> N
     print(" [3] Clear Ingested ABC (Revert to Autoregressive Generation)")
     if last_abc:
         print(" [4] Lock Most Recently Synthesized ABC Score")
+    print(" [5] Export Active / Last ABC Score to Multi-Tempo SMF1 MIDI (.mid)")
     print(" [0] Return")
     print("-" * 76)
     choice = input("Select action: ").strip()
@@ -665,6 +728,44 @@ def prompt_abc_menu(req: GenerationRequest, last_abc: Optional[str] = None) -> N
         print(
             f"\n[+] Locked {len(req.abc.splitlines())} lines of synthesized ABC notation."
         )
+    elif choice == "5":
+        active_abc = (
+            req.abc.strip()
+            if (req.abc and req.abc.strip())
+            else (last_abc.strip() if (last_abc and last_abc.strip()) else "")
+        )
+        if not active_abc:
+            print(
+                "\n[!] No ingested or recently synthesized ABC score available to export."
+            )
+            return
+        default_mid = str(Path(req.output_path).with_suffix(".mid"))
+        dest_str = (
+            input(f"Enter output MIDI path [{default_mid}]: ").strip() or default_mid
+        )
+        override_bpm = 0.0
+        if req.bpm and req.bpm > 0:
+            ov_ans = (
+                input(
+                    f"Override ABC inline/header tempo with {req.bpm} BPM? [y/N]: "
+                )
+                .strip()
+                .lower()
+            )
+            if ov_ans in ("y", "yes"):
+                override_bpm = float(req.bpm)
+        try:
+            saved_path, n_bytes, meta = _export_abc_to_midi_file(
+                active_abc, dest_str, override_bpm=override_bpm
+            )
+            ts_n, ts_d = meta["time_signature"]
+            print(
+                f"\n[+] Exported SMF1 MIDI : {saved_path} ({n_bytes:,} bytes | "
+                f"{meta['note_count']} notes | {meta['tempo_count']} tempo event(s) | "
+                f"init={meta['bpm']:.2f} BPM | {ts_n}/{ts_d})"
+            )
+        except Exception as exc:
+            print(f"\n[!] SMF1 MIDI export failed: {exc}")
 
 
 def prompt_reference_audio_menu(req: GenerationRequest) -> None:
@@ -1215,6 +1316,12 @@ def main() -> None:
         default=None,
         help="Path to ABC score file or inline ABC string.",
     )
+    parser.add_argument(
+        "--export_midi",
+        type=str,
+        default=None,
+        help="Optional destination .mid path to export synthesized or ingested ABC as multi-tempo SMF1 MIDI.",
+    )
     parser.add_argument("--cot", type=str, choices=SUPPORTED_COT, default=None)
     parser.add_argument(
         "--reference_audio",
@@ -1407,6 +1514,16 @@ def main() -> None:
             engine.warmup()
         resp = engine.synthesize(req)
         print_telemetry(resp, req)
+        if args.export_midi:
+            abc_src = (resp.abc_notation or req.abc or "").strip()
+            if abc_src:
+                saved_path, n_bytes, meta = _export_abc_to_midi_file(
+                    abc_src, args.export_midi
+                )
+                print(
+                    f"[+] Exported SMF1 MIDI : {saved_path} ({n_bytes:,} bytes | "
+                    f"{meta['note_count']} notes | {meta['tempo_count']} tempo event(s))"
+                )
     else:
         preloaded_engine: Optional[MusicEngine] = None
         if args.warmup:

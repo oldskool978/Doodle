@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import gc
 import hashlib
-import inspect
 import json
 import logging
 import os
@@ -50,50 +49,15 @@ from engine import MusicEngine
 from models.modeling_vae import enforce_full_precision_reductions
 from models.modeling_yue2 import synthesize_audio_pe_fp32
 from models.tokenizer import compile_qwen_ranks_binary, is_swiss5_fast_container
+from refinery import (
+    DTYPE_MAP,
+    PhysicsLab,
+    clear_refinery_cache,
+    contender_cast,
+    refineTensor,
+)
 
 enforce_full_precision_reductions()
-
-try:
-    from refinery import (
-        DTYPE_LOOKUP,
-        DTYPE_MAP,
-        FP8_DTYPES,
-        PhysicsLab,
-        clear_refinery_cache,
-        contender_cast,
-        refineTensor,
-    )
-
-    HAS_REFINERY = True
-except ImportError:
-    HAS_REFINERY = False
-    PhysicsLab = None  # type: ignore[assignment]
-    DTYPE_MAP = {
-        "native": None,
-        "none": None,
-        "bf16": torch.bfloat16,
-        "fp16": torch.float16,
-        "fp32": torch.float32,
-        "e4m3fn": getattr(torch, "float8_e4m3fn", None),
-        "e4m3fnuz": getattr(torch, "float8_e4m3fnuz", None),
-        "e5m2": getattr(torch, "float8_e5m2", None),
-        "e5m2fnuz": getattr(torch, "float8_e5m2fnuz", None),
-    }
-    DTYPE_LOOKUP = {
-        "fp32": torch.float32,
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "e4m3fn": getattr(torch, "float8_e4m3fn", None),
-        "e4m3fnuz": getattr(torch, "float8_e4m3fnuz", None),
-        "e5m2": getattr(torch, "float8_e5m2", None),
-        "e5m2fnuz": getattr(torch, "float8_e5m2fnuz", None),
-        "e8m0fnu": getattr(torch, "float8_e8m0fnu", None),
-    }
-    FP8_DTYPES = [
-        v
-        for k, v in DTYPE_LOOKUP.items()
-        if k in ("e4m3fn", "e4m3fnuz", "e5m2", "e5m2fnuz", "e8m0fnu") and v is not None
-    ]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,7 +79,7 @@ PRECISION_CHOICES = [
     "e5m2fnuz",
 ]
 QUANT_ENGINES = ["dto_ca", "clean_rtn"]
-DEFAULT_QUANT_ENGINE = "dto_ca" if HAS_REFINERY else "clean_rtn"
+DEFAULT_QUANT_ENGINE = "dto_ca"
 
 IGNORE_DOWNLOAD_PATTERNS = [
     "*.bin",
@@ -178,26 +142,6 @@ def _resolve_compute_device(device_str: str) -> torch.device:
     return torch.device(device_str)
 
 
-def _snapshot_download_compat(
-    repo_id: str, max_workers: int, ignore_patterns: List[str]
-) -> Path:
-    kwargs: Dict[str, object] = {
-        "repo_id": repo_id,
-        "repo_type": "model",
-        "max_workers": max_workers,
-        "ignore_patterns": ignore_patterns,
-    }
-    try:
-        params = inspect.signature(snapshot_download).parameters
-        if "resume_download" in params:
-            kwargs["resume_download"] = True
-        if "local_dir_use_symlinks" in params:
-            kwargs["local_dir_use_symlinks"] = False
-    except (TypeError, ValueError):
-        pass
-    return Path(snapshot_download(**kwargs)).resolve()
-
-
 def sha256_file(path: Path) -> str:
     hasher = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -241,44 +185,21 @@ def quantize_clean_rtn(
     *,
     phase_offset: int = 0,
 ) -> torch.Tensor:
-    if HAS_REFINERY:
-        eff_dev = (
-            torch.device("cpu")
-            if (compute_device.type == "mps" and tensor.dtype == torch.float64)
-            else compute_device
-        )
-        src_t = (
-            tensor.to(device=eff_dev, dtype=torch.float32)
-            if (tensor.dtype == torch.bfloat16 and target_dtype != torch.bfloat16)
-            else tensor.to(device=eff_dev)
-        )
-        return (
-            contender_cast(src_t, target_dtype, phase_offset=phase_offset)
-            .cpu()
-            .contiguous()
-        )
-
     eff_dev = (
-        torch.device("cpu") if compute_device.type == "mps" else compute_device
+        torch.device("cpu")
+        if (compute_device.type == "mps" and tensor.dtype == torch.float64)
+        else compute_device
     )
-    t_f64 = tensor.to(device=eff_dev, dtype=torch.float64)
-    try:
-        finfo = torch.finfo(target_dtype)
-        lo, hi = float(finfo.min), float(finfo.max)
-    except Exception:
-        name = str(target_dtype).split(".")[-1]
-        if name == "float8_e4m3fnuz":
-            lo, hi = (-240.0, 240.0)
-        elif name in ("float8_e5m2", "float8_e5m2fnuz"):
-            lo, hi = (-57344.0, 57344.0)
-        else:
-            lo, hi = (-448.0, 448.0)
-    clamped = torch.clamp(t_f64, lo, hi)
-    if target_dtype in (torch.bfloat16, torch.float16, torch.float32):
-        out = clamped.to(dtype=target_dtype)
-    else:
-        out = clamped.to(dtype=torch.float32).to(dtype=target_dtype)
-    return out.cpu().contiguous()
+    src_t = (
+        tensor.to(device=eff_dev, dtype=torch.float32)
+        if (tensor.dtype == torch.bfloat16 and target_dtype != torch.bfloat16)
+        else tensor.to(device=eff_dev)
+    )
+    return (
+        contender_cast(src_t, target_dtype, phase_offset=phase_offset)
+        .cpu()
+        .contiguous()
+    )
 
 
 def read_conditioning_marker(repo_path: Path) -> Optional[dict]:
@@ -492,12 +413,9 @@ def condition_model_shards(
                     and is_fp32_bridge_or_norm(key)
                     and tensor.dtype != torch.float32
                 ):
-                    if (
-                        HAS_REFINERY
-                        and PhysicsLab is not None
-                        and PhysicsLab.get_mantissa_width(tensor.dtype)
-                        > PhysicsLab.get_mantissa_width(torch.float32)
-                    ):
+                    if PhysicsLab.get_mantissa_width(
+                        tensor.dtype
+                    ) > PhysicsLab.get_mantissa_width(torch.float32):
                         eff_dev = (
                             torch.device("cpu")
                             if (
@@ -538,13 +456,10 @@ def condition_model_shards(
                         )
                         else compute_device
                     )
-                    if quant_engine == "dto_ca" and HAS_REFINERY:
+                    if quant_engine == "dto_ca":
                         refined = refineTensor(
                             origin_tensor=src_for_quant,
                             target_dtype=target_dtype,
-                            fp8_dtypes=FP8_DTYPES,
-                            dtype_map=DTYPE_LOOKUP,
-                            original_on_disk_dtype=tensor.dtype,
                             target_device=eff_dev,
                             phase_offset=phase_off,
                         )
@@ -582,8 +497,7 @@ def condition_model_shards(
 
     if compute_device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
-    if HAS_REFINERY:
-        clear_refinery_cache()
+    clear_refinery_cache()
 
     marker_payload = {
         "precision": precision,
@@ -635,18 +549,24 @@ def download_and_condition_weights(
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     logging.info("Initiating backbone acquisition for: %s", repo_id)
-    backbone_path = _snapshot_download_compat(
-        repo_id=repo_id,
-        max_workers=max_workers,
-        ignore_patterns=IGNORE_DOWNLOAD_PATTERNS,
-    )
+    backbone_path = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            max_workers=max_workers,
+            ignore_patterns=IGNORE_DOWNLOAD_PATTERNS,
+        )
+    ).resolve()
 
     logging.info("Initiating VAE acquisition for: %s", vae_repo_id)
-    vae_path = _snapshot_download_compat(
-        repo_id=vae_repo_id,
-        max_workers=max_workers,
-        ignore_patterns=IGNORE_DOWNLOAD_PATTERNS,
-    )
+    vae_path = Path(
+        snapshot_download(
+            repo_id=vae_repo_id,
+            repo_type="model",
+            max_workers=max_workers,
+            ignore_patterns=IGNORE_DOWNLOAD_PATTERNS,
+        )
+    ).resolve()
 
     verify_upstream_manifest(backbone_path)
     verify_vae_snapshot(vae_path)
@@ -737,19 +657,17 @@ def prompt_precision_menu() -> Tuple[str, str, str]:
     if precision == "native":
         return "native", DEFAULT_QUANT_ENGINE, "auto"
 
-    quant_engine = DEFAULT_QUANT_ENGINE
-    if HAS_REFINERY:
-        print("\n" + "-" * 80)
-        print(" Select Quantization Engine:")
-        print(
-            " [1] Contender Refinery (DTO-CA) - 64-Aligned Chunked 3D Doubly-Balanced Bayer Straddle Projection (Default)"
-        )
-        print(
-            " [2] Contender Direct (RTN+)     - Single-Shot 3D Doubly-Balanced Grace-Bayer Bracketed Projection"
-        )
-        print("-" * 80)
-        eng_choice = input("Select engine [1-2] (Default: 1): ").strip()
-        quant_engine = "clean_rtn" if eng_choice == "2" else "dto_ca"
+    print("\n" + "-" * 80)
+    print(" Select Quantization Engine:")
+    print(
+        " [1] Contender Refinery (DTO-CA) - 64-Aligned Chunked 3D Doubly-Balanced Bayer Straddle Projection (Default)"
+    )
+    print(
+        " [2] Contender Direct (RTN+)     - Single-Shot 3D Doubly-Balanced Grace-Bayer Bracketed Projection"
+    )
+    print("-" * 80)
+    eng_choice = input("Select engine [1-2] (Default: 1): ").strip()
+    quant_engine = "clean_rtn" if eng_choice == "2" else "dto_ca"
 
     print("\n" + "-" * 80)
     print(" Select Compute Target for Conversion Pass:")

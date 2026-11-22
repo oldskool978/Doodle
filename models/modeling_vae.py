@@ -10,13 +10,10 @@ from torch import nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig, PreTrainedModel
 
-HAS_NEW_FP32_PRECISION_API: bool = bool(
-    hasattr(torch.backends, "fp32_precision")
-    or (
-        hasattr(torch.backends, "cuda")
-        and hasattr(torch.backends.cuda, "matmul")
-        and hasattr(torch.backends.cuda.matmul, "fp32_precision")
-    )
+from refinery import (
+    can_use_conductor_tensor,
+    get_conductor_context,
+    warmup_conductor_gpu,
 )
 
 _MAX_CONV_WORKSPACE_BYTES: int = 16 * 1024 * 1024
@@ -50,8 +47,6 @@ enforce_full_precision_reductions()
 
 
 def _discover_fp32_precision_targets() -> Tuple[object, ...]:
-    if not HAS_NEW_FP32_PRECISION_API:
-        return ()
     candidates: List[object] = [torch.backends]
     mkldnn_mod = getattr(torch.backends, "mkldnn", None)
     cudnn_mod = getattr(torch.backends, "cudnn", None)
@@ -99,17 +94,11 @@ class IEEE754FP32Guard:
     __slots__ = (
         "_saved_targets",
         "_saved_reduction_locks",
-        "_prev_fp32_prec",
-        "_prev_matmul_tf32",
-        "_prev_cudnn_tf32",
     )
 
     def __init__(self) -> None:
         self._saved_targets: Optional[List[Tuple[object, str]]] = None
         self._saved_reduction_locks: Optional[List[Tuple[object, str, bool]]] = None
-        self._prev_fp32_prec: Optional[str] = None
-        self._prev_matmul_tf32: Optional[bool] = None
-        self._prev_cudnn_tf32: Optional[bool] = None
 
     def __enter__(self) -> IEEE754FP32Guard:
         cuda_mod = getattr(torch.backends, "cuda", None)
@@ -135,20 +124,6 @@ class IEEE754FP32Guard:
             for mod, _ in saved:
                 if mod.fp32_precision != "ieee":
                     mod.fp32_precision = "ieee"
-            return self
-
-        if hasattr(torch, "get_float32_matmul_precision"):
-            self._prev_fp32_prec = torch.get_float32_matmul_precision()
-            torch.set_float32_matmul_precision("highest")
-        if mm_mod is not None and hasattr(mm_mod, "allow_tf32"):
-            self._prev_matmul_tf32 = bool(mm_mod.allow_tf32)
-            mm_mod.allow_tf32 = False
-        if hasattr(torch.backends, "cudnn") and hasattr(
-            torch.backends.cudnn, "allow_tf32"
-        ):
-            cudnn_backend = torch.backends.cudnn
-            self._prev_cudnn_tf32 = bool(cudnn_backend.allow_tf32)
-            cudnn_backend.allow_tf32 = False
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -157,19 +132,6 @@ class IEEE754FP32Guard:
                 if mod.fp32_precision != prev_mode:
                     mod.fp32_precision = prev_mode
             self._saved_targets = None
-        else:
-            if self._prev_fp32_prec is not None and hasattr(
-                torch, "set_float32_matmul_precision"
-            ):
-                torch.set_float32_matmul_precision(self._prev_fp32_prec)
-            if self._prev_cudnn_tf32 is not None and hasattr(torch.backends, "cudnn"):
-                torch.backends.cudnn.allow_tf32 = self._prev_cudnn_tf32
-            if (
-                self._prev_matmul_tf32 is not None
-                and hasattr(torch.backends, "cuda")
-                and hasattr(torch.backends.cuda, "matmul")
-            ):
-                torch.backends.cuda.matmul.allow_tf32 = self._prev_matmul_tf32
 
         if self._saved_reduction_locks is not None:
             for mod, attr, prev_val in reversed(self._saved_reduction_locks):
@@ -1035,11 +997,35 @@ def fold_weight_norm_dict(
 
 
 def snake_beta_fused(
-    x: torch.Tensor, alpha_val: torch.Tensor, inv_beta_val: torch.Tensor
+    x: torch.Tensor,
+    alpha_val: torch.Tensor,
+    inv_beta_val: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if (
+        x.device.type == "cuda"
+        and x.dtype == torch.float32
+        and x.ndim >= 2
+        and not x.is_meta
+        and not alpha_val.is_meta
+        and not inv_beta_val.is_meta
+        and alpha_val.numel() == x.shape[-2]
+        and inv_beta_val.numel() == x.shape[-2]
+        and can_use_conductor_tensor(x.device, torch.float32, dst_dtype=torch.float32)
+    ):
+        ctx = get_conductor_context()
+        if ctx is not None:
+            return ctx.snake_beta_f32(x, alpha_val, inv_beta_val, out=out)
+
     grad_active = torch.is_grad_enabled() and (
         x.requires_grad or alpha_val.requires_grad or inv_beta_val.requires_grad
     )
+    if out is not None and (grad_active or out.requires_grad):
+        raise RuntimeError(
+            "Preallocated output buffer (out=) cannot be used while autograd is tracking gradients."
+        )
+
     if x.dtype in (torch.float32, torch.float64):
         a_c = alpha_val if alpha_val.dtype == x.dtype else alpha_val.to(dtype=x.dtype)
         ib_c = (
@@ -1053,6 +1039,8 @@ def snake_beta_fused(
         buf = x * a_c
         buf.sin_()
         buf.mul_(buf)
+        if out is not None:
+            return torch.addcmul(x, buf, ib_c, out=out)
         return torch.addcmul(x, buf, ib_c, out=buf)
 
     x_f32 = x.float()
@@ -1063,10 +1051,31 @@ def snake_beta_fused(
     if grad_active:
         s = torch.sin(x_f32 * a_f32)
         return torch.addcmul(x_f32, s * s, ib_f32).to(dtype=x.dtype)
+    if (
+        x_f32.device.type == "cuda"
+        and x_f32.ndim >= 2
+        and not x_f32.is_meta
+        and alpha_val.numel() == x_f32.shape[-2]
+        and inv_beta_val.numel() == x_f32.shape[-2]
+        and can_use_conductor_tensor(
+            x_f32.device, torch.float32, dst_dtype=torch.float32
+        )
+    ):
+        ctx = get_conductor_context()
+        if ctx is not None:
+            res_f32 = ctx.snake_beta_f32(x_f32, a_f32, ib_f32)
+            if out is not None:
+                out.copy_(res_f32)
+                return out
+            return res_f32.to(dtype=x.dtype)
     buf = x_f32 * a_f32
     buf.sin_()
     buf.mul_(buf)
-    return torch.addcmul(x_f32, buf, ib_f32, out=buf).to(dtype=x.dtype)
+    res = torch.addcmul(x_f32, buf, ib_f32, out=buf).to(dtype=x.dtype)
+    if out is not None:
+        out.copy_(res)
+        return out
+    return res
 
 
 class SnakeBeta(nn.Module):
@@ -1756,6 +1765,8 @@ class YuE2VAE(PreTrainedModel):
             model.load_state_dict(fused_state, strict=True)
             model.to(device=device, dtype=torch.float32).eval()
             model._materialize_snake_caches()
+            if model.decoder_device.type == "cuda":
+                warmup_conductor_gpu(model.decoder_device)
             return model
 
     @property
@@ -2078,7 +2089,6 @@ class YuE2VAE(PreTrainedModel):
 
 
 __all__ = [
-    "HAS_NEW_FP32_PRECISION_API",
     "IEEE754FP32Guard",
     "enforce_full_precision_reductions",
     "SovereignConv1d",

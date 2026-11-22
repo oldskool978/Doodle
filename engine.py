@@ -10,7 +10,7 @@ import random
 import shutil
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, cast
 import warnings
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -60,7 +60,15 @@ from models.modeling_yue2 import (
     synthesize_audio_pe_fp32,
 )
 from models.tokenizer import YuE2Tokenizer
-from refinery import PhysicsLab, clear_refinery_cache, contender_cast, refineTensor
+from refinery import (
+    PhysicsLab,
+    clear_refinery_cache,
+    contender_cast,
+    get_conductor_context,
+    get_conductor_info,
+    refineTensor,
+    warmup_conductor_gpu,
+)
 from schema import (
     GenerationRequest,
     GenerationResponse,
@@ -112,15 +120,28 @@ def _contender_project_to_dtype(
     *,
     phase_offset: int = 0,
     unbiased: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if tensor.dtype == target_dtype:
+        if out is not None:
+            if tensor.numel() > 0:
+                out.copy_(tensor)
+            return out
         return tensor
     if PhysicsLab.get_mantissa_width(tensor.dtype) > PhysicsLab.get_mantissa_width(
         target_dtype
     ):
         return contender_cast(
-            tensor, target_dtype, phase_offset=phase_offset, unbiased=unbiased
+            tensor,
+            target_dtype,
+            phase_offset=phase_offset,
+            unbiased=unbiased,
+            out=out,
         )
+    if out is not None:
+        if tensor.numel() > 0:
+            out.copy_(tensor)
+        return out
     return tensor.to(dtype=target_dtype)
 
 
@@ -833,39 +854,6 @@ def sample_categorical_distribution_with_entropy(
     return int(readout[0]) + vocab_offset, float(readout[1])
 
 
-def sample_categorical_distribution(
-    logits: torch.Tensor,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    history: List[int],
-    step: int,
-    min_tokens: int,
-    penalty: float,
-    penalty_window: int,
-    phase: str,
-    generator: torch.Generator,
-    vocab_offset: int = 0,
-    penalty_state: Optional[_RollingPenaltyState] = None,
-) -> int:
-    tok, _ = sample_categorical_distribution_with_entropy(
-        logits=logits,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        history=history,
-        step=step,
-        min_tokens=min_tokens,
-        penalty=penalty,
-        penalty_window=penalty_window,
-        phase=phase,
-        generator=generator,
-        vocab_offset=vocab_offset,
-        penalty_state=penalty_state,
-    )
-    return tok
-
-
 def partition_song_chunks(
     prefix: List[int],
     codec: List[int],
@@ -1052,6 +1040,8 @@ class CachedNARChunkSolver:
         initial_noise: torch.Tensor,
         nar_cond_end: int = 0,
         ref_clean: Optional[torch.Tensor] = None,
+        *,
+        use_cuda_graph: bool = True,
     ):
         self.model = model
         self.chunk_tokens = chunk_tokens
@@ -1116,14 +1106,58 @@ class CachedNARChunkSolver:
                 dtype=torch.float32,
                 device=self.device,
             )
+            self._t_shifted_buf = torch.full(
+                (1,), 0.5, dtype=self._acc_dtype, device=self.device
+            )
+            self._graph_vel_out = torch.empty(
+                (len(initial_noise), model.config.latent_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            cfg = model.config
+            act_dt = self.trunk_dtype
+            self._nar_norm_buf = torch.empty(
+                (1, self.nar_length, cfg.hidden_size),
+                dtype=act_dt,
+                device=self.device,
+            )
+            self._nar_q_buf = torch.empty(
+                (1, cfg.num_attention_heads, self.nar_length, cfg.head_dim),
+                dtype=act_dt,
+                device=self.device,
+            )
+            self._nar_mlp_act_buf = torch.empty(
+                (1, self.nar_length, cfg.intermediate_size),
+                dtype=act_dt,
+                device=self.device,
+            )
             self.kv_buffers: List[Tuple[torch.Tensor, torch.Tensor]] = []
+            self._vel_graph: Optional[Any] = None
+            self._vel_stream: Optional[Any] = None
+
         self._prefill_ar()
+        if (
+            use_cuda_graph
+            and self.device.type == "cuda"
+            and hasattr(torch.cuda, "CUDAGraph")
+            and not torch.is_grad_enabled()
+        ):
+            self._capture_velocity_graph()
+
+    @property
+    def graph_active(self) -> bool:
+        return self._vel_graph is not None
 
     def _prefill_ar(self) -> None:
         with torch.inference_mode():
             backbone = self.model.model
+            layers = backbone.layers
+            n_layers = len(layers)
+            if n_layers == 0:
+                return
             cond_len = self.cond_length
             act_dt = self.trunk_dtype
+            cfg = self.model.config
             tokens_tensor = torch.tensor(
                 [self.chunk_tokens[:cond_len]], dtype=torch.long, device=self.device
             )
@@ -1131,40 +1165,183 @@ class CachedNARChunkSolver:
             cos, sin = backbone.rotary_emb(positions, seq_len_hint=cond_len)
             emb = backbone.embed_tokens(tokens_tensor)
             x_f32 = emb if emb.dtype == torch.float32 else emb.float()
-            total_kv_len = cond_len + self.nar_length
-            num_kv_heads = self.model.config.num_key_value_heads
-            head_dim = self.model.config.head_dim
+            if not x_f32.is_contiguous():
+                x_f32 = x_f32.contiguous()
 
-            for layer in backbone.layers:
-                q, k, v = layer.self_attn.project_qkv(
-                    layer.input_layernorm.forward_to_dtype(x_f32, act_dt), cos, sin
+            total_kv_len = cond_len + self.nar_length
+            num_kv_heads = cfg.num_key_value_heads
+            head_dim = cfg.head_dim
+
+            ar_norm_buf = torch.empty(
+                (1, cond_len, cfg.hidden_size), dtype=act_dt, device=self.device
+            )
+            ar_q_buf = torch.empty(
+                (1, cfg.num_attention_heads, cond_len, head_dim),
+                dtype=act_dt,
+                device=self.device,
+            )
+            ar_mlp_act_buf = torch.empty(
+                (1, cond_len, cfg.intermediate_size),
+                dtype=act_dt,
+                device=self.device,
+            )
+
+            with IEEE754FP32Guard():
+                norm_in = layers[0].input_layernorm.forward_to_dtype(
+                    x_f32, act_dt, out=ar_norm_buf
                 )
-                q_tx = q.transpose(1, 2)
-                k_tx = k.transpose(1, 2)
-                v_tx = v.transpose(1, 2)
-                with torch.inference_mode(False):
-                    k_buf = torch.empty(
-                        (1, num_kv_heads, total_kv_len, head_dim),
-                        dtype=act_dt,
-                        device=self.device,
+                for i, layer in enumerate(layers):
+                    with torch.inference_mode(False):
+                        k_buf = torch.empty(
+                            (1, num_kv_heads, total_kv_len, head_dim),
+                            dtype=act_dt,
+                            device=self.device,
+                        )
+                        v_buf = torch.empty(
+                            (1, num_kv_heads, total_kv_len, head_dim),
+                            dtype=act_dt,
+                            device=self.device,
+                        )
+                    q_tx = layer.self_attn.project_qkv_into_kv_cache(
+                        norm_in,
+                        cos,
+                        sin,
+                        k_buf,
+                        v_buf,
+                        0,
+                        q_out=ar_q_buf,
                     )
-                    v_buf = torch.empty(
-                        (1, num_kv_heads, total_kv_len, head_dim),
-                        dtype=act_dt,
-                        device=self.device,
+                    self.kv_buffers.append((k_buf, v_buf))
+                    if i + 1 == n_layers:
+                        break
+                    h = sdpa(
+                        q_tx,
+                        k_buf[:, :, :cond_len, :],
+                        v_buf[:, :, :cond_len, :],
+                        is_causal=(cond_len > 1),
+                    ).transpose(1, 2)
+                    o_f32 = layer.self_attn.o_proj.forward_fp32(
+                        h.reshape(1, cond_len, -1)
                     )
-                k_buf[:, :, :cond_len, :].copy_(k_tx)
-                v_buf[:, :, :cond_len, :].copy_(v_tx)
-                self.kv_buffers.append((k_buf, v_buf))
-                h = sdpa(q_tx, k_tx, v_tx, is_causal=(cond_len > 1)).transpose(1, 2)
-                o_f32 = layer.self_attn.o_proj.forward_fp32(
-                    h.reshape(1, cond_len, -1)
+                    x_f32, norm_mlp = (
+                        layer.post_attention_layernorm.forward_residual_to_dtype(
+                            x_f32,
+                            o_f32,
+                            act_dt,
+                            res_out=x_f32,
+                            norm_out=ar_norm_buf,
+                        )
+                    )
+                    m_f32 = layer.mlp.forward_fp32(norm_mlp, act_out=ar_mlp_act_buf)
+                    x_f32, norm_in = layers[
+                        i + 1
+                    ].input_layernorm.forward_residual_to_dtype(
+                        x_f32,
+                        m_f32,
+                        act_dt,
+                        res_out=x_f32,
+                        norm_out=ar_norm_buf,
+                    )
+
+    def _velocity_body_fp32(self) -> torch.Tensor:
+        x_f32 = self.model.project_latent_to_trunk_fp32(
+            self.x_nar_buf_f32, self._t_shifted_buf, self.pos_emb_f32
+        )
+        if not x_f32.is_contiguous():
+            x_f32 = x_f32.contiguous()
+
+        cond_len = self.cond_length
+        act_dt = self.trunk_dtype
+        norm_buf = self._nar_norm_buf
+        q_buf = self._nar_q_buf
+        mlp_act_buf = self._nar_mlp_act_buf
+        layers = self.model.model.layers
+        n_layers = len(layers)
+
+        with IEEE754FP32Guard(), torch.autocast(
+            device_type=self.device.type, enabled=False
+        ):
+            if n_layers > 0:
+                norm_in = layers[0].nar_input_layernorm.forward_to_dtype(
+                    x_f32, act_dt, out=norm_buf
                 )
-                x_f32.add_(o_f32)
-                m_f32 = layer.mlp.forward_fp32(
-                    layer.post_attention_layernorm.forward_to_dtype(x_f32, act_dt)
-                )
-                x_f32.add_(m_f32)
+                for i, (layer, (k_buf, v_buf)) in enumerate(
+                    zip(layers, self.kv_buffers)
+                ):
+                    q_nar = layer.nar_self_attn.project_qkv_into_kv_cache(
+                        norm_in,
+                        self.cos,
+                        self.sin,
+                        k_buf,
+                        v_buf,
+                        cond_len,
+                        q_out=q_buf,
+                    )
+                    h = sdpa(q_nar, k_buf, v_buf, is_causal=False).transpose(1, 2)
+                    o_f32 = layer.nar_self_attn.o_proj.forward_fp32(
+                        h.reshape(1, self.nar_length, -1)
+                    )
+                    x_f32, norm_mlp = (
+                        layer.nar_pre_mlp_layernorm.forward_residual_to_dtype(
+                            x_f32,
+                            o_f32,
+                            act_dt,
+                            res_out=x_f32,
+                            norm_out=norm_buf,
+                        )
+                    )
+                    m_f32 = layer.nar_mlp.forward_fp32(
+                        norm_mlp, act_out=mlp_act_buf
+                    )
+                    if i + 1 < n_layers:
+                        x_f32, norm_in = layers[
+                            i + 1
+                        ].nar_input_layernorm.forward_residual_to_dtype(
+                            x_f32,
+                            m_f32,
+                            act_dt,
+                            res_out=x_f32,
+                            norm_out=norm_buf,
+                        )
+                    else:
+                        x_f32.add_(m_f32)
+
+        return self.model.project_trunk_to_velocity_fp32(x_f32[:, 1:-1, :])[0]
+
+    def _capture_velocity_graph(self) -> None:
+        if hasattr(torch.cuda, "is_current_stream_capturing"):
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            except Exception:
+                return
+        try:
+            warmup_conductor_gpu(self.device)
+            cap_stream = torch.cuda.Stream(device=self.device)
+            cur_stream = torch.cuda.current_stream(self.device)
+            cap_stream.wait_stream(cur_stream)
+
+            with torch.inference_mode(), IEEE754FP32Guard(), torch.autocast(
+                device_type="cuda", enabled=False
+            ):
+                with torch.cuda.stream(cap_stream):
+                    self.x_nar_buf_f32.zero_()
+                    self._t_shifted_buf.fill_(0.5)
+                    for _ in range(2):
+                        self._graph_vel_out.copy_(self._velocity_body_fp32())
+                cur_stream.wait_stream(cap_stream)
+                torch.cuda.synchronize(self.device)
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=cap_stream):
+                    self._graph_vel_out.copy_(self._velocity_body_fp32())
+                torch.cuda.synchronize(self.device)
+
+            self._vel_graph = graph
+            self._vel_stream = cap_stream
+        except Exception:
+            self._vel_graph = None
+            self._vel_stream = None
 
     def _project_reference_manifold(self, state: torch.Tensor, tau: float) -> None:
         if (
@@ -1195,42 +1372,35 @@ class CachedNARChunkSolver:
                         )
                     )
 
-    def velocity(self, state: torch.Tensor, raw_t: float) -> torch.Tensor:
+    def velocity(
+        self,
+        state: torch.Tensor,
+        raw_t: float,
+        *,
+        copy_out: bool = True,
+    ) -> torch.Tensor:
         caller_in_inf = torch.is_inference_mode_enabled()
         with torch.inference_mode():
             state_dev = state if state.device == self.device else state.to(self.device)
-            state_f32 = _contender_project_to_dtype(
-                state_dev, torch.float32, phase_offset=57
+            _contender_project_to_dtype(
+                state_dev,
+                torch.float32,
+                phase_offset=57,
+                out=self.x_nar_buf_f32[0, 1:-1],
             )
-            self.x_nar_buf_f32[0, 0].zero_()
-            self.x_nar_buf_f32[0, -1].zero_()
-            self.x_nar_buf_f32[0, 1:-1].copy_(state_f32)
-            x_f32 = self.model.project_latent_to_trunk_fp32(
-                self.x_nar_buf_f32, raw_t, self.pos_emb_f32
-            )
-            cond_len = self.cond_length
-            act_dt = self.trunk_dtype
+            self._t_shifted_buf.fill_(self.model.shift_t_scalar(raw_t))
 
-            for layer, (k_buf, v_buf) in zip(self.model.model.layers, self.kv_buffers):
-                q, k, v = layer.nar_self_attn.project_qkv(
-                    layer.nar_input_layernorm.forward_to_dtype(x_f32, act_dt),
-                    self.cos,
-                    self.sin,
-                )
-                q_tx = q.transpose(1, 2)
-                k_buf[:, :, cond_len:, :].copy_(k.transpose(1, 2))
-                v_buf[:, :, cond_len:, :].copy_(v.transpose(1, 2))
-                h = sdpa(q_tx, k_buf, v_buf, is_causal=False).transpose(1, 2)
-                o_f32 = layer.nar_self_attn.o_proj.forward_fp32(
-                    h.reshape(1, self.nar_length, -1)
-                )
-                x_f32.add_(o_f32)
-                m_f32 = layer.nar_mlp.forward_fp32(
-                    layer.nar_pre_mlp_layernorm.forward_to_dtype(x_f32, act_dt)
-                )
-                x_f32.add_(m_f32)
+            if self._vel_graph is not None:
+                self._vel_graph.replay()
+                if not copy_out:
+                    return self._graph_vel_out
+                if not caller_in_inf:
+                    with torch.inference_mode(False):
+                        return self._graph_vel_out.clone()
+                return self._graph_vel_out.clone()
 
-            vel_f32 = self.model.project_trunk_to_velocity_fp32(x_f32[:, 1:-1, :])[0]
+            vel_f32 = self._velocity_body_fp32()
+
         if not caller_in_inf and vel_f32.is_inference():
             with torch.inference_mode(False):
                 return vel_f32.clone()
@@ -1251,6 +1421,7 @@ class CachedNARChunkSolver:
         caller_in_inf = torch.is_inference_mode_enabled()
         with torch.inference_mode():
             acc_dt = self._acc_dtype
+            need_copy_out = acc_dt == torch.float32
             init_dev = self.initial_noise.to(device=self.device)
             if init_dev.dtype == acc_dt:
                 state_acc = init_dev.clone()
@@ -1276,24 +1447,34 @@ class CachedNARChunkSolver:
                 raw_t = self._logit_clamped(t)
 
                 if method == "euler":
-                    v = self.velocity(state_acc, raw_t).to(dtype=acc_dt)
+                    v = self.velocity(
+                        state_acc, raw_t, copy_out=need_copy_out
+                    ).to(dtype=acc_dt)
                     state_acc.sub_(v, alpha=dt)
                 elif method == "heun":
-                    v1 = self.velocity(state_acc, raw_t).to(dtype=acc_dt)
+                    v1 = self.velocity(
+                        state_acc, raw_t, copy_out=need_copy_out
+                    ).to(dtype=acc_dt)
                     torch.add(state_acc, v1, alpha=-dt, out=scratch_acc)
                     t_next = max(0.0, float(steps - (step + 1)) * inv_steps)
                     self._project_reference_manifold(scratch_acc, t_next)
                     raw_next = self._logit_clamped(t_next)
-                    v2 = self.velocity(scratch_acc, raw_next).to(dtype=acc_dt)
+                    v2 = self.velocity(
+                        scratch_acc, raw_next, copy_out=need_copy_out
+                    ).to(dtype=acc_dt)
                     v1.add_(v2)
                     state_acc.sub_(v1, alpha=half_dt)
                 else:
-                    v1 = self.velocity(state_acc, raw_t).to(dtype=acc_dt)
+                    v1 = self.velocity(
+                        state_acc, raw_t, copy_out=need_copy_out
+                    ).to(dtype=acc_dt)
                     torch.add(state_acc, v1, alpha=-half_dt, out=scratch_acc)
                     t_mid = max(0.0, (float(steps - step) - 0.5) * inv_steps)
                     self._project_reference_manifold(scratch_acc, t_mid)
                     raw_mid = self._logit_clamped(t_mid)
-                    v2 = self.velocity(scratch_acc, raw_mid).to(dtype=acc_dt)
+                    v2 = self.velocity(
+                        scratch_acc, raw_mid, copy_out=need_copy_out
+                    ).to(dtype=acc_dt)
                     state_acc.sub_(v2, alpha=dt)
 
                 if step_callback is not None:
@@ -1319,8 +1500,18 @@ class CachedNARChunkSolver:
         return result
 
     def close(self) -> None:
+        if self._vel_graph is not None:
+            try:
+                self._vel_graph.reset()
+            except Exception:
+                pass
+            self._vel_graph = None
+        self._vel_stream = None
+        self._t_shifted_buf = None
+        self._graph_vel_out = None
         self.kv_buffers.clear()
         self.cos = self.sin = self.pos_emb_f32 = self.x_nar_buf_f32 = None
+        self._nar_norm_buf = self._nar_q_buf = self._nar_mlp_act_buf = None
         self.ref_clean = self.ref_noise = None
         self._ref_clean_acc = self._ref_noise_acc = None
 
@@ -1365,7 +1556,6 @@ def _apply_non_degradative_placement(
                 prepared_state[key] = refineTensor(
                     origin_tensor=tensor,
                     target_dtype=trunk_dtype,
-                    original_on_disk_dtype=tensor.dtype,
                     target_device=target_device,
                     phase_offset=idx & 63,
                 )
@@ -1446,6 +1636,104 @@ class MusicEngine:
         self._abc_prefix_cache: Optional[StaticKVCache] = None
         self._abc_cached_tokens: List[int] = []
 
+    def conductor_info(self) -> Dict[str, Any]:
+        return get_conductor_info()
+
+    def _require_conductor(self) -> Any:
+        ctx = get_conductor_context()
+        if ctx is None:
+            raise RuntimeError(
+                "Native Conductor runtime is unavailable under doodle/conductor/."
+            )
+        return ctx
+
+    def analyze_abc(
+        self,
+        abc_text: Union[str, bytes],
+        *,
+        override_bpm: float = 0.0,
+        include_bars: bool = True,
+    ) -> Any:
+        return self._require_conductor().analyze_abc(
+            abc_text, override_bpm=override_bpm, include_bars=include_bars
+        )
+
+    def rewrite_abc_tempo(
+        self, abc_text: Union[str, bytes], target_bpm: float
+    ) -> str:
+        return str(
+            self._require_conductor().rewrite_abc_tempo(abc_text, target_bpm)
+        )
+
+    def abc_extract_midi(
+        self,
+        abc_text: Union[str, bytes],
+        *,
+        override_bpm: float = 0.0,
+    ) -> Tuple[Tuple[Any, ...], Tuple[Any, ...], Dict[str, Any]]:
+        return self._require_conductor().abc_extract_midi(
+            abc_text, override_bpm=float(override_bpm)
+        )
+
+    def abc_to_midi_smf1(
+        self,
+        abc_text: Union[str, bytes],
+        *,
+        override_bpm: float = 0.0,
+    ) -> Tuple[bytes, Dict[str, Any]]:
+        return self._require_conductor().abc_to_midi_smf1(
+            abc_text, override_bpm=float(override_bpm)
+        )
+
+    def encode_midi_smf1(
+        self,
+        notes: Sequence[Any],
+        *,
+        bpm: float = 120.0,
+        milli_bpm: Optional[int] = None,
+        tempos: Optional[Sequence[Any]] = None,
+        time_signature: Tuple[int, int] = (4, 4),
+        key_sf: int = 0,
+        is_minor: bool = False,
+    ) -> bytes:
+        return bytes(
+            self._require_conductor().encode_midi_smf1(
+                notes,
+                bpm=bpm,
+                milli_bpm=milli_bpm,
+                tempos=tempos,
+                time_signature=time_signature,
+                key_sf=key_sf,
+                is_minor=is_minor,
+            )
+        )
+
+    def decode_midi_smf1(
+        self, midi_bytes: Union[bytes, bytearray, memoryview]
+    ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+        return self._require_conductor().decode_midi_smf1(midi_bytes)
+
+    def estimate_acoustic_bpm(
+        self,
+        audio: Union[torch.Tensor, np.ndarray],
+        sample_rate: int = TARGET_SAMPLE_RATE,
+        *,
+        min_bpm: float = 50.0,
+        max_bpm: float = 200.0,
+        prior_bpm: float = 0.0,
+        planar: Optional[bool] = None,
+    ) -> float:
+        return float(
+            self._require_conductor().estimate_acoustic_bpm(
+                audio,
+                int(sample_rate),
+                min_bpm=float(min_bpm),
+                max_bpm=float(max_bpm),
+                prior_bpm=float(prior_bpm),
+                planar=planar,
+            )
+        )
+
     def _reset_prefix_cache(self) -> None:
         self._abc_prefix_cache = None
         self._abc_cached_tokens = []
@@ -1467,6 +1755,9 @@ class MusicEngine:
             raise RuntimeError(
                 "CUDA execution requested but no compatible GPU detected."
             )
+
+        if self.device.type == "cuda":
+            warmup_conductor_gpu(self.device)
 
         with torch.inference_mode(False):
             if self.model is not None and self._current_offload_state != cpu_offload:
@@ -2158,6 +2449,40 @@ class MusicEngine:
         actual_duration = total_samples / float(TARGET_SAMPLE_RATE)
         rtf = elapsed_time / max(actual_duration, 1e-6)
 
+        cnd_info = get_conductor_info()
+        cnd_ctx = get_conductor_context()
+        abc_bar_count = 0
+        abc_bpm: Optional[float] = None
+        measured_bpm: Optional[float] = None
+        if cnd_ctx is not None:
+            if abc_output_text and abc_output_text.strip():
+                try:
+                    ana = cnd_ctx.analyze_abc(abc_output_text, include_bars=False)
+                    abc_bar_count = int(ana.bar_count)
+                    if ana.bpm > 0.0:
+                        abc_bpm = float(ana.bpm)
+                except Exception:
+                    pass
+            if actual_duration >= 2.0:
+                try:
+                    prior_bpm = (
+                        float(request.bpm)
+                        if (request.bpm and request.bpm > 0)
+                        else (float(abc_bpm) if (abc_bpm and abc_bpm > 0.0) else 0.0)
+                    )
+                    est_bpm = float(
+                        cnd_ctx.estimate_acoustic_bpm(
+                            audio_data,
+                            TARGET_SAMPLE_RATE,
+                            prior_bpm=prior_bpm,
+                            planar=False,
+                        )
+                    )
+                    if est_bpm > 0.0:
+                        measured_bpm = est_bpm
+                except Exception:
+                    pass
+
         return GenerationResponse(
             output_path=str(out_path),
             sample_rate=TARGET_SAMPLE_RATE,
@@ -2192,6 +2517,13 @@ class MusicEngine:
             abc_perplexity=abc_ppl,
             semantic_mean_entropy_bits=sem_mean_ent,
             semantic_perplexity=sem_ppl,
+            conductor_active=bool(cnd_info["active"]),
+            conductor_abi_version=int(cnd_info["abi_version"]),
+            conductor_gpu_backend=str(cnd_info["gpu_backend"]),
+            conductor_fast_lut_active=bool(cnd_info["has_fast_lut"]),
+            measured_bpm=measured_bpm,
+            abc_bar_count=abc_bar_count,
+            abc_bpm=abc_bpm,
         )
 
     def generate(
@@ -2228,6 +2560,9 @@ class MusicEngine:
         self._init_components(cpu_offload=False, require_vae_encoder=False)
         assert self.model is not None and self.vae is not None
         t0 = time.perf_counter()
+
+        if self.device.type == "cuda":
+            warmup_conductor_gpu(self.device)
 
         sys.stdout.write("  [1/3] Warmup: Autoregressive Backbone Prefill Pass...\n")
         sys.stdout.flush()

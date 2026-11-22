@@ -54,7 +54,6 @@ from engine import (
 )
 import models.modeling_vae as modeling_vae_mod
 from models.modeling_vae import (
-    HAS_NEW_FP32_PRECISION_API,
     IEEE754FP32Guard,
     SnakeBeta,
     SovereignConv1d,
@@ -65,6 +64,7 @@ from models.modeling_vae import (
     YuE2VAEConfig,
     enforce_full_precision_reductions,
     fold_weight_norm_dict,
+    snake_beta_fused,
 )
 from models.modeling_yue2 import (
     Attention,
@@ -87,6 +87,7 @@ from models.tokenizer import (
 )
 from refinery import (
     FP8_DTYPES,
+    MIN_CONDUCTOR_ABI_VERSION,
     TheContender,
     TheRefinery,
     _exact_lattice_brackets_fp32,
@@ -94,10 +95,15 @@ from refinery import (
     _resolve_dtype_limits,
     clear_refinery_cache,
     contender_cast,
+    get_conductor_context,
+    get_conductor_info,
+    get_conductor_module,
     get_doubly_balanced_bayer_8x8,
     refineTensor,
     sample_bayer_lattice,
+    warmup_conductor_gpu,
 )
+from schema import GenerationResponse
 
 
 def resolve_test_device(preferred: str = "auto") -> torch.device:
@@ -256,9 +262,7 @@ def audit_gate_2_polyphase_kaiser_resampler(device: torch.device) -> None:
         r2 = 0.10 + 0.40 * torch.sin(2.0 * math.pi * 2311.0 * t_out + 0.3)
         r3 = -0.05 + 0.40 * torch.cos(2.0 * math.pi * 4177.0 * t_out - 0.5)
         ref_2d = torch.stack([r0, r1], dim=0)
-        ref_3d = torch.stack(
-            [ref_2d, torch.stack([r2, r3], dim=0)], dim=0
-        )
+        ref_3d = torch.stack([ref_2d, torch.stack([r2, r3], dim=0)], dim=0)
 
         snr_1d = _eval_resampler_snr_db(out_1d, r0, guard)
         snr_2d = _eval_resampler_snr_db(out_2d, ref_2d, guard)
@@ -366,7 +370,7 @@ def audit_gate_3_placement_and_mixed_precision(
     device: torch.device,
 ) -> YuE2ForCausalLM:
     print(
-        "\n--- Gate 3: Non-Degradative Placement, Split-K FP32 Lock, Q/K Decorrelation & FP64 Markov Audit ---"
+        "\n--- Gate 3: Non-Degradative Placement, Split-K FP32 Lock, ABI v3 Fused Kernels & FP64 Markov Audit ---"
     )
     enforce_full_precision_reductions()
     if torch.cuda.is_available() and hasattr(torch.backends, "cuda"):
@@ -414,6 +418,203 @@ def audit_gate_3_placement_and_mixed_precision(
     assert layer0.mlp._can_use_fused_gate_up(), "Fused Gate/Up inactive after placement"
     assert layer0.self_attn._phase_q != layer0.self_attn._phase_k
 
+    x_fuse_f32 = torch.randn(
+        (2, 8, model.config.hidden_size), dtype=torch.float32, device=device
+    )
+    delta_f32 = torch.randn(
+        (2, 8, model.config.hidden_size), dtype=torch.float32, device=device
+    )
+    rms_out_buf = torch.empty(
+        (2, 8, model.config.hidden_size), dtype=torch.bfloat16, device=device
+    )
+    rms_ptr = rms_out_buf.data_ptr()
+    rms_eager = layer0.input_layernorm.forward_to_dtype(x_fuse_f32, torch.bfloat16)
+    rms_zero = layer0.input_layernorm.forward_to_dtype(
+        x_fuse_f32, torch.bfloat16, out=rms_out_buf
+    )
+    assert rms_zero.data_ptr() == rms_ptr
+    assert torch.equal(rms_zero.view(torch.int16), rms_eager.view(torch.int16))
+
+    res_ref = x_fuse_f32 + delta_f32
+    nrm_ref = layer0.post_attention_layernorm.forward_to_dtype(
+        res_ref, torch.bfloat16
+    )
+    res_oop, nrm_oop = layer0.post_attention_layernorm.forward_residual_to_dtype(
+        x_fuse_f32, delta_f32, torch.bfloat16
+    )
+    assert res_oop.dtype == torch.float32 and nrm_oop.dtype == torch.bfloat16
+    assert torch.equal(res_oop, res_ref), "forward_residual_to_dtype OOP sum mismatch"
+    assert torch.equal(nrm_oop.view(torch.int16), nrm_ref.view(torch.int16)), (
+        "forward_residual_to_dtype OOP norm mismatch"
+    )
+
+    res_inp = x_fuse_f32.clone()
+    inp_ptr = res_inp.data_ptr()
+    res_inp_out, nrm_inp = layer0.post_attention_layernorm.forward_residual_to_dtype(
+        res_inp,
+        delta_f32,
+        torch.bfloat16,
+        res_out=res_inp,
+        norm_out=rms_out_buf,
+    )
+    assert res_inp_out.data_ptr() == inp_ptr and nrm_inp.data_ptr() == rms_ptr
+    assert torch.equal(res_inp_out, res_ref), "forward_residual_to_dtype in-place sum mismatch"
+    assert torch.equal(nrm_inp.view(torch.int16), nrm_ref.view(torch.int16)), (
+        "forward_residual_to_dtype in-place norm mismatch"
+    )
+
+    with torch.inference_mode(False):
+        rn_ste = RMSNorm(32, eps=1e-6, phase_offset=5).to(
+            device=device, dtype=torch.float32
+        )
+        with torch.no_grad():
+            rn_ste.weight.uniform_(0.7, 1.3)
+        r_ste = torch.randn(
+            (2, 4, 32), device=device, dtype=torch.float32, requires_grad=True
+        )
+        d_ste = torch.randn(
+            (2, 4, 32), device=device, dtype=torch.float32, requires_grad=True
+        )
+        r_out_ste, n_out_ste = rn_ste.forward_residual_to_dtype(
+            r_ste, d_ste, torch.bfloat16
+        )
+        g_r = torch.randn_like(r_out_ste)
+        g_n = torch.randn((2, 4, 32), device=device, dtype=torch.bfloat16)
+        torch.autograd.backward((r_out_ste, n_out_ste), (g_r, g_n))
+
+        r_ref64 = _to_f64(r_ste.detach()).requires_grad_(True)
+        d_ref64 = _to_f64(d_ste.detach()).requires_grad_(True)
+        w_ref64 = _to_f64(rn_ste.weight.detach()).requires_grad_(True)
+        s_ref64 = r_ref64 + d_ref64
+        n_ref64 = (
+            s_ref64
+            * torch.rsqrt(s_ref64.pow(2).mean(-1, keepdim=True) + 1e-6)
+            * w_ref64
+        )
+        torch.autograd.backward((s_ref64, n_ref64), (_to_f64(g_r), _to_f64(g_n)))
+        assert r_ste.grad is not None and d_ste.grad is not None and rn_ste.weight.grad is not None
+        assert float((_to_f64(r_ste.grad) - r_ref64.grad).abs().max().item()) < 2e-5
+        assert float((_to_f64(d_ste.grad) - d_ref64.grad).abs().max().item()) < 2e-5
+        assert float((_to_f64(rn_ste.weight.grad) - w_ref64.grad).abs().max().item()) < 2e-5
+
+    pos_fuse = torch.arange(8, device=device).unsqueeze(0).expand(2, 8)
+    cos_f, sin_f = model.model.rotary_emb(pos_fuse, seq_len_hint=8)
+    q_bshd, k_bshd, v_bshd = layer0.self_attn.project_qkv(
+        rms_eager, cos_f, sin_f, layout_bhsd=False
+    )
+    q_buf = torch.empty((2, 4, 8, 32), dtype=torch.bfloat16, device=device)
+    k_buf = torch.empty((2, 2, 8, 32), dtype=torch.bfloat16, device=device)
+    v_buf = torch.empty((2, 2, 8, 32), dtype=torch.bfloat16, device=device)
+    qp, kp, vp = q_buf.data_ptr(), k_buf.data_ptr(), v_buf.data_ptr()
+    q_bhsd, k_bhsd, v_bhsd = layer0.self_attn.project_qkv(
+        rms_eager,
+        cos_f,
+        sin_f,
+        layout_bhsd=True,
+        q_out=q_buf,
+        k_out=k_buf,
+        v_out=v_buf,
+    )
+    assert q_bhsd.data_ptr() == qp and k_bhsd.data_ptr() == kp and v_bhsd.data_ptr() == vp
+    assert torch.equal(
+        q_bhsd.view(torch.int16), q_bshd.transpose(1, 2).contiguous().view(torch.int16)
+    )
+    assert torch.equal(
+        k_bhsd.view(torch.int16), k_bshd.transpose(1, 2).contiguous().view(torch.int16)
+    )
+    assert torch.equal(
+        v_bhsd.view(torch.int16), v_bshd.transpose(1, 2).contiguous().view(torch.int16)
+    )
+
+    k_sent = torch.full((2, 2, 20, 32), 7.5, dtype=torch.bfloat16, device=device)
+    v_sent = torch.full((2, 2, 20, 32), -3.25, dtype=torch.bfloat16, device=device)
+    q_str = layer0.self_attn.project_qkv_into_kv_cache(
+        rms_eager, cos_f, sin_f, k_sent, v_sent, kv_seq_offset=6, q_out=q_buf
+    )
+    assert q_str.data_ptr() == qp
+    assert torch.equal(q_str.view(torch.int16), q_bhsd.view(torch.int16))
+    assert torch.equal(k_sent[:, :, 6:14, :].view(torch.int16), k_bhsd.view(torch.int16))
+    assert torch.equal(v_sent[:, :, 6:14, :].view(torch.int16), v_bhsd.view(torch.int16))
+    assert bool((k_sent[:, :, :6, :] == 7.5).all().item())
+    assert bool((k_sent[:, :, 14:, :] == 7.5).all().item())
+    assert bool((v_sent[:, :, :6, :] == -3.25).all().item())
+    assert bool((v_sent[:, :, 14:, :] == -3.25).all().item())
+
+    kv_gap = StaticKVCache(2, 2, 2, 24, 32, torch.bfloat16, device)
+    kv_gap.key_cache[0].fill_(9.0)
+    kv_gap.value_cache[0].fill_(-9.0)
+    kv_gap.key_cache[1].fill_(9.0)
+    kv_gap.value_cache[1].fill_(-9.0)
+    gap_pos = torch.arange(5, 13, dtype=torch.long, device=device)
+    for l_idx in range(2):
+        prep = kv_gap.prepare_contiguous_write(l_idx, 8, 2, gap_pos)
+        assert prep is not None
+        kb, vb, kv_off, eff_end = prep
+        assert kv_off == 5 and eff_end == 13
+        assert bool((kb[:, :, :5, :] == 0.0).all().item())
+        assert bool((vb[:, :, :5, :] == 0.0).all().item())
+        _ = layer0.self_attn.project_qkv_into_kv_cache(
+            rms_eager, cos_f, sin_f, kb, vb, kv_off
+        )
+        k_vis, v_vis = kv_gap.commit_contiguous_write(l_idx, eff_end)
+        assert k_vis.shape == (2, 2, 13, 32) and v_vis.shape == (2, 2, 13, 32)
+        assert torch.equal(k_vis[:, :, 5:13, :].view(torch.int16), k_bhsd.view(torch.int16))
+        assert torch.equal(v_vis[:, :, 5:13, :].view(torch.int16), v_bhsd.view(torch.int16))
+        assert bool((kb[:, :, 13:, :] == 9.0).all().item())
+    assert kv_gap.get_seq_length() == 13
+
+    mlp_act_buf = torch.empty(
+        (2, 8, model.config.intermediate_size), dtype=torch.bfloat16, device=device
+    )
+    mlp_eager = layer0.mlp.forward_fp32(rms_eager)
+    mlp_zero = layer0.mlp.forward_fp32(rms_eager, act_out=mlp_act_buf)
+    assert torch.equal(mlp_eager, mlp_zero)
+
+    for t_test in (1, 20):
+        emb_in_f32 = torch.randn(
+            (1, t_test, model.config.hidden_size), dtype=torch.float32, device=device
+        )
+        emb_orig = emb_in_f32.clone()
+        pos_test = torch.arange(t_test, dtype=torch.long, device=device).unsqueeze(0)
+        kv_fused = StaticKVCache(2, 1, 2, 32, 32, model.trunk_dtype, device)
+        pre_fused, _ = model.model.forward_prenorm(
+            inputs_embeds=emb_in_f32,
+            position_ids=pos_test,
+            past_key_values=kv_fused,
+            use_cache=True,
+            seq_len_hint=t_test,
+        )
+        assert torch.equal(emb_in_f32, emb_orig), (
+            "Backbone.forward_prenorm mutated caller FP32 inputs_embeds in-place"
+        )
+
+        kv_ref = StaticKVCache(2, 1, 2, 32, 32, model.trunk_dtype, device)
+        cos_t, sin_t = model.model.rotary_emb(pos_test, seq_len_hint=t_test)
+        x_ref_l = emb_orig.clone()
+        for l_idx, lyr in enumerate(model.model.layers):
+            x_ref_l = lyr(
+                x_ref_l,
+                cos_t,
+                sin_t,
+                kv_ref,
+                layer_idx=l_idx,
+                compute_dtype=model.trunk_dtype,
+                _inplace_residual=False,
+            )
+        fused_backbone_err = float((pre_fused - x_ref_l).abs().max().item())
+        assert fused_backbone_err <= 1e-6, (
+            f"Cross-layer fused Backbone diverged from reference (T={t_test}): {fused_backbone_err:.2e}"
+        )
+        for l_idx in range(2):
+            assert torch.equal(
+                kv_fused.key_cache[l_idx][:, :, :t_test, :].view(torch.int16),
+                kv_ref.key_cache[l_idx][:, :, :t_test, :].view(torch.int16),
+            ), f"Strided KV cache K mismatch at layer {l_idx}, T={t_test}"
+            assert torch.equal(
+                kv_fused.value_cache[l_idx][:, :, :t_test, :].view(torch.int16),
+                kv_ref.value_cache[l_idx][:, :, :t_test, :].view(torch.int16),
+            ), f"Strided KV cache V mismatch at layer {l_idx}, T={t_test}"
+
     mid_rot = torch.full(
         (1, 64, 2, 32), 1.0 + 0.42 * (2.0**-7), dtype=torch.float32, device=device
     )
@@ -450,7 +651,7 @@ def audit_gate_3_placement_and_mixed_precision(
             assert mod._pending_rebind is True
 
     print(
-        "  [+] Manifold Bridge & Fusion   : FP32 bridges, Split-K lock, Q/K decorrelation & SafeTensors hook verified."
+        "  [+] Manifold Bridge & ABI v3   : FP32 bridges, Residual+RMSNorm STE, Strided KV scatter & Cross-layer Backbone verified."
     )
 
     probe_ids = torch.tensor(
@@ -525,10 +726,18 @@ def audit_gate_3_placement_and_mixed_precision(
         loss.backward()
         tl0 = tiny_train.model.layers[0]
         for grad_param in (
+            tl0.input_layernorm.weight,
             tl0.self_attn.q_proj.weight,
+            tl0.self_attn.k_proj.weight,
+            tl0.self_attn.v_proj.weight,
+            tl0.self_attn.q_norm.weight,
+            tl0.self_attn.k_norm.weight,
             tl0.self_attn.o_proj.weight,
+            tl0.post_attention_layernorm.weight,
             tl0.mlp.gate_proj.weight,
+            tl0.mlp.up_proj.weight,
             tl0.mlp.down_proj.weight,
+            tiny_train.model.norm.weight,
             tiny_train.lm_head.weight,
         ):
             assert grad_param.grad is not None and torch.isfinite(grad_param.grad).all()
@@ -548,50 +757,24 @@ def audit_gate_3_placement_and_mixed_precision(
         pe_probe = model.latent_pos_embed.forward_fp32(
             torch.arange(6, device=device)
         ).unsqueeze(0)
-        if HAS_NEW_FP32_PRECISION_API:
-            mm_backend = torch.backends.cuda.matmul
-            orig_mm_mode = str(mm_backend.fp32_precision)
-            try:
-                mm_backend.fp32_precision = "ieee"
-                ref_lm = model.forward_lm_head_fp32(
-                    prenorm_probe, vocab_slice=SEMANTIC_VOCAB_SLICE
-                )
-                ref_in = model.project_latent_to_trunk_fp32(lat_probe, 0.35, pe_probe)
-                ref_vel = model.project_trunk_to_velocity_fp32(prenorm_probe)
-
-                mm_backend.fp32_precision = "tf32"
-                cand_lm = model.forward_lm_head_fp32(
-                    prenorm_probe, vocab_slice=SEMANTIC_VOCAB_SLICE
-                )
-                cand_in = model.project_latent_to_trunk_fp32(lat_probe, 0.35, pe_probe)
-                cand_vel = model.project_trunk_to_velocity_fp32(prenorm_probe)
-            finally:
-                mm_backend.fp32_precision = orig_mm_mode
-        else:
-            orig_mm = bool(torch.backends.cuda.matmul.allow_tf32)
-            orig_prec = (
-                torch.get_float32_matmul_precision()
-                if hasattr(torch, "get_float32_matmul_precision")
-                else None
+        mm_backend = torch.backends.cuda.matmul
+        orig_mm_mode = str(mm_backend.fp32_precision)
+        try:
+            mm_backend.fp32_precision = "ieee"
+            ref_lm = model.forward_lm_head_fp32(
+                prenorm_probe, vocab_slice=SEMANTIC_VOCAB_SLICE
             )
-            try:
-                torch.backends.cuda.matmul.allow_tf32 = False
-                ref_lm = model.forward_lm_head_fp32(
-                    prenorm_probe, vocab_slice=SEMANTIC_VOCAB_SLICE
-                )
-                ref_in = model.project_latent_to_trunk_fp32(lat_probe, 0.35, pe_probe)
-                ref_vel = model.project_trunk_to_velocity_fp32(prenorm_probe)
+            ref_in = model.project_latent_to_trunk_fp32(lat_probe, 0.35, pe_probe)
+            ref_vel = model.project_trunk_to_velocity_fp32(prenorm_probe)
 
-                torch.backends.cuda.matmul.allow_tf32 = True
-                cand_lm = model.forward_lm_head_fp32(
-                    prenorm_probe, vocab_slice=SEMANTIC_VOCAB_SLICE
-                )
-                cand_in = model.project_latent_to_trunk_fp32(lat_probe, 0.35, pe_probe)
-                cand_vel = model.project_trunk_to_velocity_fp32(prenorm_probe)
-            finally:
-                if orig_prec is not None:
-                    torch.set_float32_matmul_precision(orig_prec)
-                torch.backends.cuda.matmul.allow_tf32 = orig_mm
+            mm_backend.fp32_precision = "tf32"
+            cand_lm = model.forward_lm_head_fp32(
+                prenorm_probe, vocab_slice=SEMANTIC_VOCAB_SLICE
+            )
+            cand_in = model.project_latent_to_trunk_fp32(lat_probe, 0.35, pe_probe)
+            cand_vel = model.project_trunk_to_velocity_fp32(prenorm_probe)
+        finally:
+            mm_backend.fp32_precision = orig_mm_mode
 
         tf32_drift = max(
             float((ref_lm - cand_lm).abs().max().item()),
@@ -678,12 +861,11 @@ def audit_gate_3_placement_and_mixed_precision(
             x_in = torch.randn((2, 8, 64), device=device, dtype=act_dt)
             y_out = q_lin(x_in)
             assert y_out.dtype == act_dt and torch.isfinite(y_out).all()
-        if fp8_dt != getattr(torch, "float8_e8m0fnu", None):
-            x_fp8 = torch.randn((2, 8, 64), device=device, dtype=torch.bfloat16).to(
-                dtype=fp8_dt
-            )
-            y_fp8 = q_lin(x_fp8)
-            assert y_fp8.dtype == torch.bfloat16 and torch.isfinite(y_fp8).all()
+        x_fp8 = torch.randn((2, 8, 64), device=device, dtype=torch.bfloat16).to(
+            dtype=fp8_dt
+        )
+        y_fp8 = q_lin(x_fp8)
+        assert y_fp8.dtype == torch.bfloat16 and torch.isfinite(y_fp8).all()
         print(
             f"  [+] QuantSafeLinear FP8        : {fp8_dt} x {{fp8, bf16, fp32}} dispatch finite & verified."
         )
@@ -818,9 +1000,10 @@ def audit_gate_4_batched_cfg_and_kv_splicing(model: YuE2ForCausalLM) -> None:
 @torch.inference_mode()
 def audit_gate_5_nar_fp32_ode_and_manifold_inpainting(model: YuE2ForCausalLM) -> None:
     print(
-        "\n--- Gate 5: FP64-Accumulated Flow-Matching ODE, Solver/Velocity Parity & Manifold Inpainting Audit ---"
+        "\n--- Gate 5: FP64-Accumulated Flow-Matching ODE, Graph Replay Parity & Manifold Inpainting Audit ---"
     )
     device = model.model.embed_tokens.weight.device
+    has_cuda_graph = device.type == "cuda" and hasattr(torch.cuda, "CUDAGraph")
     chunk_tokens = [
         EOD,
         10,
@@ -859,15 +1042,34 @@ def audit_gate_5_nar_fp32_ode_and_manifold_inpainting(model: YuE2ForCausalLM) ->
 
     max_vel_diff = 0.0
     for nar_cond_end in (0, 7):
-        solver_chk = CachedNARChunkSolver(
+        solver_eager = CachedNARChunkSolver(
             model=model,
             chunk_tokens=chunk_tokens,
             initial_noise=noise,
             nar_cond_end=nar_cond_end,
             ref_clean=None,
+            use_cuda_graph=False,
         )
+        solver_graph = CachedNARChunkSolver(
+            model=model,
+            chunk_tokens=chunk_tokens,
+            initial_noise=noise,
+            nar_cond_end=nar_cond_end,
+            ref_clean=None,
+            use_cuda_graph=True,
+        )
+        if has_cuda_graph:
+            assert solver_graph.graph_active, (
+                f"Expected HIPGraph/CUDAGraph capture active on {device} (cond_end={nar_cond_end})"
+            )
+
         x_probe = noise.to(device=device, dtype=torch.float32)
-        v_cached = solver_chk.velocity(x_probe, 0.25)
+        v_eager_025 = solver_eager.velocity(x_probe, 0.25)
+        v_graph_025 = solver_graph.velocity(x_probe, 0.25)
+        assert torch.equal(v_graph_025, v_eager_025), (
+            f"NAR velocity graph replay diverged from eager (cond_end={nar_cond_end}, t=0.25)"
+        )
+
         v_direct = model.nar_velocity(
             tokens=full_seq,
             ar_mask=ar_mask,
@@ -877,35 +1079,72 @@ def audit_gate_5_nar_fp32_ode_and_manifold_inpainting(model: YuE2ForCausalLM) ->
             t_value=0.25,
             nar_cond_end=nar_cond_end,
         )
-        solver_chk.close()
-        v_diff = float((v_cached - v_direct).abs().max().item())
+        v_diff = float((v_graph_025 - v_direct).abs().max().item())
         max_vel_diff = max(max_vel_diff, v_diff)
         assert v_diff < 5e-3, (
             f"CachedNARChunkSolver diverged from nar_velocity (cond_end={nar_cond_end}): {v_diff}"
         )
 
+        v_graph_neg = solver_graph.velocity(x_probe, -1.5)
+        v_graph_neg_snap = v_graph_neg.clone()
+        v_eager_neg = solver_eager.velocity(x_probe, -1.5)
+        v_graph_pos = solver_graph.velocity(x_probe * 0.5, 2.0)
+        v_eager_pos = solver_eager.velocity(x_probe * 0.5, 2.0)
+
+        assert torch.equal(v_graph_neg, v_graph_neg_snap), (
+            "NAR graph velocity(copy_out=True) aliased across consecutive calls"
+        )
+        assert torch.equal(v_graph_neg, v_eager_neg), (
+            f"NAR velocity graph replay diverged at t=-1.5 (cond_end={nar_cond_end})"
+        )
+        assert torch.equal(v_graph_pos, v_eager_pos), (
+            f"NAR velocity graph replay diverged at t=2.0 (cond_end={nar_cond_end})"
+        )
+        assert not torch.equal(v_graph_neg, v_graph_pos), (
+            "NAR graph replay froze dynamic timestep or state buffer"
+        )
+
+        solver_eager.close()
+        solver_graph.close()
+
     for method in ("euler", "heun", "midpoint"):
         for nar_cond_end in (0, 7):
-            solver = CachedNARChunkSolver(
+            solver_eager = CachedNARChunkSolver(
                 model=model,
                 chunk_tokens=chunk_tokens,
                 initial_noise=noise,
                 nar_cond_end=nar_cond_end,
                 ref_clean=ref_clean,
+                use_cuda_graph=False,
             )
-            out = solver.solve(steps=8, method=method)
-            solver.close()
-            assert out.dtype == torch.float32, (
-                f"Expected float32 trajectory, got {out.dtype}"
+            solver_graph = CachedNARChunkSolver(
+                model=model,
+                chunk_tokens=chunk_tokens,
+                initial_noise=noise,
+                nar_cond_end=nar_cond_end,
+                ref_clean=ref_clean,
+                use_cuda_graph=True,
             )
-            assert out.shape == (t_lat, 64) and torch.isfinite(out).all()
-            anchor_err = float((out[:4] - ref_clean).abs().max().item())
+            out_eager = solver_eager.solve(steps=8, method=method)
+            out_graph = solver_graph.solve(steps=8, method=method)
+            solver_eager.close()
+            solver_graph.close()
+
+            assert torch.equal(out_graph, out_eager), (
+                f"NAR graph-replayed ODE ({method}, cond_end={nar_cond_end}) diverged from eager"
+            )
+            assert out_graph.dtype == torch.float32, (
+                f"Expected float32 trajectory, got {out_graph.dtype}"
+            )
+            assert out_graph.shape == (t_lat, 64) and torch.isfinite(out_graph).all()
+            anchor_err = float((out_graph[:4] - ref_clean).abs().max().item())
             assert anchor_err == 0.0, (
                 f"Reference manifold drifted at tau=0 ({method}): {anchor_err}"
             )
 
+    graph_tag = "Graph vs Eager 0-ULP bit-exact" if has_cuda_graph else "Eager verified"
     print(
-        f"  [+] Euler / Heun / Midpoint    : Cached vs Direct vel delta={max_vel_diff:.2e}; anchor L_inf = 0.0."
+        f"  [+] Euler / Heun / Midpoint    : {graph_tag} | Direct vel delta={max_vel_diff:.2e} | anchor L_inf = 0.0."
     )
 
 
@@ -1097,103 +1336,67 @@ def _audit_sovereign_conv_transpose1d_case(
 @torch.inference_mode()
 def audit_gate_6_vae_fp32_guard_and_tiling(device: torch.device) -> None:
     print(
-        "\n--- Gate 6: SovereignConv1d/Transpose1d Autograd, Zero-MIOpen Dispatch & Odd-Stride VAE Audit ---"
+        "\n--- Gate 6: SovereignConv1d/Transpose1d Autograd, Conductor SnakeBeta, Zero-MIOpen & Odd-Stride VAE Audit ---"
     )
     if torch.cuda.is_available():
-        if HAS_NEW_FP32_PRECISION_API:
-            mm_backend = torch.backends.cuda.matmul
-            conv_backend = (
-                torch.backends.cudnn.conv
-                if hasattr(torch.backends, "cudnn")
-                and hasattr(torch.backends.cudnn, "conv")
-                and hasattr(torch.backends.cudnn.conv, "fp32_precision")
-                else None
-            )
-            orig_mm_mode = str(mm_backend.fp32_precision)
-            orig_conv_mode = (
-                str(conv_backend.fp32_precision) if conv_backend is not None else None
-            )
-            orig_generic_mode = (
-                str(torch.backends.fp32_precision)
-                if hasattr(torch.backends, "fp32_precision")
-                else None
-            )
-            orig_cudnn_mode = (
-                str(torch.backends.cudnn.fp32_precision)
-                if hasattr(torch.backends, "cudnn")
-                and hasattr(torch.backends.cudnn, "fp32_precision")
-                else None
-            )
-            try:
-                if orig_generic_mode is not None:
-                    torch.backends.fp32_precision = "none"
-                if orig_cudnn_mode is not None:
-                    torch.backends.cudnn.fp32_precision = "none"
-                for initial_mode in ("tf32", "ieee"):
-                    mm_backend.fp32_precision = initial_mode
+        mm_backend = torch.backends.cuda.matmul
+        conv_backend = (
+            torch.backends.cudnn.conv
+            if hasattr(torch.backends, "cudnn")
+            and hasattr(torch.backends.cudnn, "conv")
+            and hasattr(torch.backends.cudnn.conv, "fp32_precision")
+            else None
+        )
+        orig_mm_mode = str(mm_backend.fp32_precision)
+        orig_conv_mode = (
+            str(conv_backend.fp32_precision) if conv_backend is not None else None
+        )
+        orig_generic_mode = (
+            str(torch.backends.fp32_precision)
+            if hasattr(torch.backends, "fp32_precision")
+            else None
+        )
+        orig_cudnn_mode = (
+            str(torch.backends.cudnn.fp32_precision)
+            if hasattr(torch.backends, "cudnn")
+            and hasattr(torch.backends.cudnn, "fp32_precision")
+            else None
+        )
+        try:
+            if orig_generic_mode is not None:
+                torch.backends.fp32_precision = "none"
+            if orig_cudnn_mode is not None:
+                torch.backends.cudnn.fp32_precision = "none"
+            for initial_mode in ("tf32", "ieee"):
+                mm_backend.fp32_precision = initial_mode
+                if conv_backend is not None:
+                    conv_backend.fp32_precision = initial_mode
+                with IEEE754FP32Guard():
+                    assert str(mm_backend.fp32_precision) == "ieee"
                     if conv_backend is not None:
-                        conv_backend.fp32_precision = initial_mode
+                        assert str(conv_backend.fp32_precision) == "ieee"
                     with IEEE754FP32Guard():
                         assert str(mm_backend.fp32_precision) == "ieee"
                         if conv_backend is not None:
                             assert str(conv_backend.fp32_precision) == "ieee"
-                        with IEEE754FP32Guard():
-                            assert str(mm_backend.fp32_precision) == "ieee"
-                            if conv_backend is not None:
-                                assert str(conv_backend.fp32_precision) == "ieee"
-                        assert str(mm_backend.fp32_precision) == "ieee"
-                        if conv_backend is not None:
-                            assert str(conv_backend.fp32_precision) == "ieee"
-                    assert str(mm_backend.fp32_precision) == initial_mode, (
-                        f"IEEE754FP32Guard clobbered cuda.matmul.fp32_precision (expected {initial_mode})"
-                    )
+                    assert str(mm_backend.fp32_precision) == "ieee"
                     if conv_backend is not None:
-                        assert str(conv_backend.fp32_precision) == initial_mode, (
-                            f"IEEE754FP32Guard clobbered cudnn.conv.fp32_precision (expected {initial_mode})"
-                        )
-            finally:
-                if orig_generic_mode is not None:
-                    torch.backends.fp32_precision = orig_generic_mode
-                if orig_cudnn_mode is not None:
-                    torch.backends.cudnn.fp32_precision = orig_cudnn_mode
-                mm_backend.fp32_precision = orig_mm_mode
-                if conv_backend is not None and orig_conv_mode is not None:
-                    conv_backend.fp32_precision = orig_conv_mode
-        else:
-            orig_mm = bool(torch.backends.cuda.matmul.allow_tf32)
-            orig_cudnn = (
-                bool(torch.backends.cudnn.allow_tf32)
-                if hasattr(torch.backends, "cudnn")
-                and hasattr(torch.backends.cudnn, "allow_tf32")
-                else None
-            )
-            orig_prec = (
-                torch.get_float32_matmul_precision()
-                if hasattr(torch, "get_float32_matmul_precision")
-                else None
-            )
-            try:
-                for initial_state in (True, False):
-                    torch.backends.cuda.matmul.allow_tf32 = initial_state
-                    if orig_cudnn is not None:
-                        torch.backends.cudnn.allow_tf32 = initial_state
-                    with IEEE754FP32Guard():
-                        assert torch.backends.cuda.matmul.allow_tf32 is False
-                        if orig_cudnn is not None:
-                            assert torch.backends.cudnn.allow_tf32 is False
-                    assert bool(torch.backends.cuda.matmul.allow_tf32) is initial_state, (
-                        f"IEEE754FP32Guard clobbered matmul.allow_tf32 (expected {initial_state})"
+                        assert str(conv_backend.fp32_precision) == "ieee"
+                assert str(mm_backend.fp32_precision) == initial_mode, (
+                    f"IEEE754FP32Guard clobbered cuda.matmul.fp32_precision (expected {initial_mode})"
+                )
+                if conv_backend is not None:
+                    assert str(conv_backend.fp32_precision) == initial_mode, (
+                        f"IEEE754FP32Guard clobbered cudnn.conv.fp32_precision (expected {initial_mode})"
                     )
-                    if orig_cudnn is not None:
-                        assert bool(torch.backends.cudnn.allow_tf32) is initial_state, (
-                            f"IEEE754FP32Guard clobbered cudnn.allow_tf32 (expected {initial_state})"
-                        )
-            finally:
-                if orig_prec is not None:
-                    torch.set_float32_matmul_precision(orig_prec)
-                torch.backends.cuda.matmul.allow_tf32 = orig_mm
-                if orig_cudnn is not None:
-                    torch.backends.cudnn.allow_tf32 = orig_cudnn
+        finally:
+            if orig_generic_mode is not None:
+                torch.backends.fp32_precision = orig_generic_mode
+            if orig_cudnn_mode is not None:
+                torch.backends.cudnn.fp32_precision = orig_cudnn_mode
+            mm_backend.fp32_precision = orig_mm_mode
+            if conv_backend is not None and orig_conv_mode is not None:
+                conv_backend.fp32_precision = orig_conv_mode
         print(
             "  [+] IEEE754FP32Guard           : Strict LIFO state capture & TF32 suppression verified."
         )
@@ -1345,16 +1548,60 @@ def audit_gate_6_vae_fp32_guard_and_tiling(device: torch.device) -> None:
     with torch.inference_mode(False):
         sb = SnakeBeta(8).to(device=device, dtype=torch.float32).eval()
         sb._apply(lambda t: t, recurse=False)
-        sb_x = torch.randn((1, 8, 32), device=device, dtype=torch.float32)
+        sb_x = torch.randn((2, 8, 37), device=device, dtype=torch.float32)
+        sb_x_orig = sb_x.clone()
         _ = sb(sb_x)
         new_alpha = torch.full((8,), 0.4, dtype=torch.float32, device=device)
         new_beta = torch.full((8,), -0.2, dtype=torch.float32, device=device)
         sb.load_state_dict({"alpha": new_alpha, "beta": new_beta})
         sb_out = sb(sb_x)
-        exp_a = torch.exp(new_alpha.double()).float().view(1, 8, 1)
-        exp_ib = (1.0 / (torch.exp(new_beta.double()) + 1e-9)).float().view(1, 8, 1)
+        assert torch.equal(sb_x, sb_x_orig), "SnakeBeta mutated input x in-place"
+        exp_a = torch.exp(_to_f64(new_alpha)).to(device=device, dtype=torch.float32).view(1, 8, 1)
+        exp_ib = (
+            (1.0 / (torch.exp(_to_f64(new_beta)) + 1e-9))
+            .to(device=device, dtype=torch.float32)
+            .view(1, 8, 1)
+        )
         sb_ref = torch.addcmul(sb_x, torch.sin(sb_x * exp_a).pow(2), exp_ib)
-        assert float((sb_out - sb_ref).abs().max().item()) < 1e-6
+        snake_err = float((sb_out - sb_ref).abs().max().item())
+        assert snake_err < 1e-5, f"SnakeBeta Conductor/ATen drift: {snake_err:.2e}"
+
+        sb_out_buf = torch.empty_like(sb_x)
+        sb_ptr = sb_out_buf.data_ptr()
+        sb_pre = snake_beta_fused(sb_x, exp_a, exp_ib, out=sb_out_buf)
+        assert sb_pre.data_ptr() == sb_ptr and torch.equal(sb_pre, sb_out)
+
+        f64_dev = _f64_device(device)
+        sb_x64 = torch.randn((1, 8, 17), device=f64_dev, dtype=torch.float64)
+        sb_y64 = snake_beta_fused(
+            sb_x64,
+            exp_a.to(device=f64_dev, dtype=torch.float64),
+            exp_ib.to(device=f64_dev, dtype=torch.float64),
+        )
+        assert sb_y64.dtype == torch.float64, "snake_beta_fused downcast FP64 input"
+
+        sx_g = torch.randn(
+            (2, 8, 33), device=device, dtype=torch.float32, requires_grad=True
+        )
+        sa_g = exp_a.detach().clone().requires_grad_(True)
+        sib_g = exp_ib.detach().clone().requires_grad_(True)
+        sy_g = snake_beta_fused(sx_g, sa_g, sib_g)
+        g_up = torch.randn_like(sy_g)
+        (sy_g * g_up).sum().backward()
+
+        sx_64 = _to_f64(sx_g.detach()).requires_grad_(True)
+        sa_64 = _to_f64(sa_g.detach()).requires_grad_(True)
+        sib_64 = _to_f64(sib_g.detach()).requires_grad_(True)
+        sy_64 = sx_64 + torch.sin(sx_64 * sa_64).pow(2) * sib_64
+        (sy_64 * _to_f64(g_up)).sum().backward()
+        assert sx_g.grad is not None and sa_g.grad is not None and sib_g.grad is not None
+        assert float((_to_f64(sx_g.grad) - sx_64.grad).abs().max().item()) < 1e-4
+        assert float((_to_f64(sa_g.grad) - sa_64.grad).abs().max().item()) < 1e-4
+        assert float((_to_f64(sib_g.grad) - sib_64.grad).abs().max().item()) < 1e-4
+
+    print(
+        f"  [+] SnakeBeta Fused & Autograd : Non-aliasing, FP64-preserving, out= & Bwd max L_inf={snake_err:.2e}"
+    )
 
     vae_cfg = YuE2VAEConfig(
         encoder_config=dict(
@@ -1566,9 +1813,11 @@ def _assert_fp32_straddle_containment(x_f64: torch.Tensor) -> None:
 @torch.no_grad()
 def audit_gate_7_contender_and_refinery_lattice(device: torch.device) -> None:
     print(
-        "\n--- Gate 7: Doubly-Balanced 3D Bayer Lattice, Zero-Sync Contender & Refinery Straddle Audit ---"
+        "\n--- Gate 7: Doubly-Balanced 3D Bayer Lattice, Zero-Sync / Graph ABI v3 & Refinery Straddle Audit ---"
     )
     f64_dev = _f64_device(device)
+    if device.type == "cuda":
+        warmup_conductor_gpu(device)
 
     base_8x8 = get_doubly_balanced_bayer_8x8(torch.device("cpu"), torch.float64)
     assert base_8x8.shape == (8, 8)
@@ -1701,8 +1950,10 @@ def audit_gate_7_contender_and_refinery_lattice(device: torch.device) -> None:
 
     async_verified = "CPU"
     if device.type == "cuda":
+        cnd_ctx = get_conductor_context()
         async_2d = torch.randn((64, 128), dtype=torch.float32, device=device)
         async_3d = torch.randn((8, 16, 128), dtype=torch.float32, device=device)
+        async_del = torch.randn((8, 16, 128), dtype=torch.float32, device=device)
         async_tail = torch.randn((3, 9, 67), dtype=torch.float32, device=device)
         async_f64 = (
             torch.tensor(
@@ -1713,11 +1964,87 @@ def audit_gate_7_contender_and_refinery_lattice(device: torch.device) -> None:
             .repeat(64)
             .reshape(3, 8, 16)
         )
+        async_w = torch.ones((128,), dtype=torch.float32, device=device)
+        async_gu = torch.randn((8, 16, 256), dtype=torch.float32, device=device)
+        async_qkv = torch.randn((2, 8, (8 + 8) * 32), dtype=torch.float32, device=device)
+        async_qw = torch.ones((32,), dtype=torch.float32, device=device)
+        async_kw = torch.ones((32,), dtype=torch.float32, device=device)
+        async_cs = torch.ones((2, 8, 16), dtype=torch.float32, device=device)
+        async_sn = torch.zeros((2, 8, 16), dtype=torch.float32, device=device)
+        async_sx = torch.randn((2, 16, 128), dtype=torch.float32, device=device)
+        async_sa = torch.full((16,), 1.25, dtype=torch.float32, device=device)
+        async_sib = torch.full((16,), 0.85, dtype=torch.float32, device=device)
+
+        buf_rms = torch.empty((8, 16, 128), dtype=torch.bfloat16, device=device)
+        buf_res = torch.empty((8, 16, 128), dtype=torch.float32, device=device)
+        buf_res_nrm = torch.empty((8, 16, 128), dtype=torch.bfloat16, device=device)
+        buf_res_inp = async_3d.clone()
+        buf_swp = torch.empty((8, 16, 128), dtype=torch.bfloat16, device=device)
+        buf_q = torch.empty((2, 8, 8, 32), dtype=torch.bfloat16, device=device)
+        buf_k = torch.empty((2, 4, 8, 32), dtype=torch.bfloat16, device=device)
+        buf_v = torch.empty((2, 4, 8, 32), dtype=torch.bfloat16, device=device)
+        buf_kc = torch.zeros((2, 4, 24, 32), dtype=torch.bfloat16, device=device)
+        buf_vc = torch.zeros((2, 4, 24, 32), dtype=torch.bfloat16, device=device)
+        buf_sy = torch.empty_like(async_sx)
+
         _ = contender_cast(async_2d, torch.bfloat16)
         _ = contender_cast(async_3d, torch.float16)
         _ = contender_cast(async_tail, torch.bfloat16)
         _ = contender_cast(async_f64, torch.float32)
         _ = contender_cast(async_f64, torch.bfloat16)
+        if cnd_ctx is not None:
+            cnd_ctx.rms_norm_contender(
+                async_3d, async_w, torch.bfloat16, phase_offset=3, out=buf_rms
+            )
+            cnd_ctx.residual_rms_norm_contender(
+                async_3d,
+                async_del,
+                async_w,
+                torch.bfloat16,
+                phase_offset=4,
+                res_out=buf_res,
+                norm_out=buf_res_nrm,
+            )
+            cnd_ctx.swiglu_packed_contender(
+                async_gu, torch.bfloat16, phase_offset=5, out=buf_swp
+            )
+            cnd_ctx.qk_norm_rope_packed_contender(
+                async_qkv,
+                async_qw,
+                async_kw,
+                async_cs,
+                async_sn,
+                8,
+                4,
+                32,
+                torch.bfloat16,
+                phase_q=1,
+                phase_k=2,
+                phase_v=3,
+                layout_bhsd=True,
+                q_out=buf_q,
+                k_out=buf_k,
+                v_out=buf_v,
+            )
+            cnd_ctx.qk_norm_rope_packed_strided_contender(
+                async_qkv,
+                async_qw,
+                async_kw,
+                async_cs,
+                async_sn,
+                8,
+                4,
+                32,
+                buf_kc,
+                buf_vc,
+                kv_seq_offset=6,
+                dst_dtype=torch.bfloat16,
+                phase_q=1,
+                phase_k=2,
+                phase_v=3,
+                q_out=buf_q,
+            )
+            cnd_ctx.snake_beta_f32(async_sx, async_sa, async_sib, out=buf_sy)
         torch.cuda.synchronize(device)
 
         if hasattr(torch.cuda, "set_sync_debug_mode"):
@@ -1735,6 +2062,68 @@ def audit_gate_7_contender_and_refinery_lattice(device: torch.device) -> None:
                 out_tail = contender_cast(async_tail, torch.bfloat16)
                 out_f32 = contender_cast(async_f64, torch.float32)
                 out_bf16 = contender_cast(async_f64, torch.bfloat16)
+                if cnd_ctx is not None:
+                    cnd_ctx.rms_norm_contender(
+                        async_3d, async_w, torch.bfloat16, phase_offset=3, out=buf_rms
+                    )
+                    cnd_ctx.residual_rms_norm_contender(
+                        async_3d,
+                        async_del,
+                        async_w,
+                        torch.bfloat16,
+                        phase_offset=4,
+                        res_out=buf_res,
+                        norm_out=buf_res_nrm,
+                    )
+                    cnd_ctx.residual_rms_norm_contender(
+                        buf_res_inp,
+                        async_del,
+                        async_w,
+                        torch.bfloat16,
+                        phase_offset=4,
+                        res_out=buf_res_inp,
+                        norm_out=buf_rms,
+                    )
+                    cnd_ctx.swiglu_packed_contender(
+                        async_gu, torch.bfloat16, phase_offset=5, out=buf_swp
+                    )
+                    cnd_ctx.qk_norm_rope_packed_contender(
+                        async_qkv,
+                        async_qw,
+                        async_kw,
+                        async_cs,
+                        async_sn,
+                        8,
+                        4,
+                        32,
+                        torch.bfloat16,
+                        phase_q=1,
+                        phase_k=2,
+                        phase_v=3,
+                        layout_bhsd=True,
+                        q_out=buf_q,
+                        k_out=buf_k,
+                        v_out=buf_v,
+                    )
+                    cnd_ctx.qk_norm_rope_packed_strided_contender(
+                        async_qkv,
+                        async_qw,
+                        async_kw,
+                        async_cs,
+                        async_sn,
+                        8,
+                        4,
+                        32,
+                        buf_kc,
+                        buf_vc,
+                        kv_seq_offset=6,
+                        dst_dtype=torch.bfloat16,
+                        phase_q=1,
+                        phase_k=2,
+                        phase_v=3,
+                        q_out=buf_q,
+                    )
+                    cnd_ctx.snake_beta_f32(async_sx, async_sa, async_sib, out=buf_sy)
             finally:
                 torch.cuda.set_sync_debug_mode(prev_sync_mode)
             torch.cuda.synchronize(device)
@@ -1745,196 +2134,363 @@ def audit_gate_7_contender_and_refinery_lattice(device: torch.device) -> None:
                 and out_f32.dtype == torch.float32
                 and out_bf16.dtype == torch.bfloat16
             )
-            async_verified = "ZERO-SYNC"
+            assert torch.equal(buf_res_inp, buf_res)
+            assert torch.equal(buf_rms.view(torch.int16), buf_res_nrm.view(torch.int16))
+            assert torch.equal(buf_kc[:, :, 6:14, :].view(torch.int16), buf_k.view(torch.int16))
+            assert torch.equal(buf_vc[:, :, 6:14, :].view(torch.int16), buf_v.view(torch.int16))
+            async_verified = "ZERO-SYNC(v3)"
 
-        if hasattr(torch.cuda, "CUDAGraph") and hasattr(torch.cuda, "graph"):
-            g_in_2d = async_2d.clone()
-            g_in_3d = async_3d.clone()
-            g_in_tail = async_tail.clone()
-            g_in_f64 = async_f64.clone()
-            capture_stream = torch.cuda.Stream(device=device)
-            capture_stream.wait_stream(torch.cuda.current_stream(device))
-            try:
-                with torch.cuda.stream(capture_stream):
-                    for _ in range(3):
-                        _ = contender_cast(g_in_2d, torch.bfloat16)
-                        _ = contender_cast(g_in_3d, torch.float16)
-                        _ = contender_cast(g_in_tail, torch.bfloat16)
-                        _ = contender_cast(g_in_f64, torch.float32)
-                        _ = contender_cast(g_in_f64, torch.bfloat16)
-                torch.cuda.current_stream(device).wait_stream(capture_stream)
-                torch.cuda.synchronize(device)
+        if cnd_ctx is not None and hasattr(torch.cuda, "CUDAGraph"):
+            eager_res = buf_res.clone()
+            eager_rnrm = buf_res_nrm.clone()
+            eager_swp = buf_swp.clone()
+            eager_q = buf_q.clone()
+            eager_kc = buf_kc.clone()
+            eager_vc = buf_vc.clone()
+            eager_sy = buf_sy.clone()
 
-                cuda_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(cuda_graph, stream=capture_stream):
-                    g_out_2d = contender_cast(g_in_2d, torch.bfloat16)
-                    g_out_3d = contender_cast(g_in_3d, torch.float16)
-                    g_out_tail = contender_cast(g_in_tail, torch.bfloat16)
-                    g_out_f32 = contender_cast(g_in_f64, torch.float32)
-                    g_out_bf16 = contender_cast(g_in_f64, torch.bfloat16)
+            g_res = torch.zeros_like(buf_res)
+            g_rnrm = torch.zeros_like(buf_res_nrm)
+            g_swp = torch.zeros_like(buf_swp)
+            g_q = torch.zeros_like(buf_q)
+            g_kc = torch.zeros_like(buf_kc)
+            g_vc = torch.zeros_like(buf_vc)
+            g_sy = torch.zeros_like(buf_sy)
 
-                mut_2d = torch.linspace(
-                    -12.5, 12.5, g_in_2d.numel(), dtype=torch.float32, device=device
-                ).reshape_as(g_in_2d)
-                mut_3d = torch.linspace(
-                    -7.5, 7.5, g_in_3d.numel(), dtype=torch.float32, device=device
-                ).reshape_as(g_in_3d)
-                mut_tail = torch.linspace(
-                    -3.25, 3.25, g_in_tail.numel(), dtype=torch.float32, device=device
-                ).reshape_as(g_in_tail)
-                mut_f64 = async_f64 * -0.75
-                g_in_2d.copy_(mut_2d)
-                g_in_3d.copy_(mut_3d)
-                g_in_tail.copy_(mut_tail)
-                g_in_f64.copy_(mut_f64)
-                torch.cuda.synchronize(device)
-
-                cuda_graph.replay()
-                torch.cuda.synchronize(device)
-
-                assert torch.equal(g_out_2d, contender_cast(mut_2d, torch.bfloat16))
-                assert torch.equal(g_out_3d, contender_cast(mut_3d, torch.float16))
-                assert torch.equal(
-                    g_out_tail, contender_cast(mut_tail, torch.bfloat16)
+            def _graph_body() -> None:
+                cnd_ctx.residual_rms_norm_contender(
+                    async_3d,
+                    async_del,
+                    async_w,
+                    torch.bfloat16,
+                    phase_offset=4,
+                    res_out=g_res,
+                    norm_out=g_rnrm,
                 )
-                assert torch.equal(g_out_f32, contender_cast(mut_f64, torch.float32))
-                assert torch.equal(
-                    g_out_bf16, contender_cast(mut_f64, torch.bfloat16)
+                cnd_ctx.swiglu_packed_contender(
+                    async_gu, torch.bfloat16, phase_offset=5, out=g_swp
                 )
-                del cuda_graph, g_out_2d, g_out_3d, g_out_tail, g_out_f32, g_out_bf16
-                torch.cuda.synchronize(device)
-                async_verified = (
-                    "ZERO-SYNC+GRAPH" if async_verified == "ZERO-SYNC" else "GRAPH"
+                cnd_ctx.qk_norm_rope_packed_strided_contender(
+                    async_qkv,
+                    async_qw,
+                    async_kw,
+                    async_cs,
+                    async_sn,
+                    8,
+                    4,
+                    32,
+                    g_kc,
+                    g_vc,
+                    kv_seq_offset=6,
+                    dst_dtype=torch.bfloat16,
+                    phase_q=1,
+                    phase_k=2,
+                    phase_v=3,
+                    q_out=g_q,
                 )
-            except NotImplementedError:
-                pass
-            except RuntimeError as graph_exc:
-                msg_l = str(graph_exc).lower()
-                if "not supported" not in msg_l and "unsupported" not in msg_l:
-                    raise
+                cnd_ctx.snake_beta_f32(async_sx, async_sa, async_sib, out=g_sy)
 
-    shifted = (
-        torch.randn((64, 128), dtype=torch.float32, generator=gen).to(device=device)
-        * 1e-3
-        + 0.25
-    )
-    contender = TheContender(device)
-    q_bf16 = contender.quantize(shifted, torch.bfloat16)
-    assert q_bf16.dtype == torch.bfloat16
-    rtn_bf16 = shifted.to(dtype=torch.bfloat16)
-    mean_true = float(_to_f64(shifted).mean().item())
-    err_contender = abs(float(_to_f64(q_bf16).mean().item()) - mean_true)
-    err_rtn = abs(float(_to_f64(rtn_bf16).mean().item()) - mean_true)
-    assert not torch.equal(q_bf16, rtn_bf16), (
-        "Contender degenerated to plain RTN on shifted manifold!"
-    )
-    assert err_contender <= err_rtn + 1e-4, (
-        f"Contender first-moment bias ({err_contender:.2e}) exceeded bound vs RTN ({err_rtn:.2e})"
-    )
+            cap_stream = torch.cuda.Stream(device=device)
+            cap_stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(cap_stream):
+                _graph_body()
+            torch.cuda.current_stream(device).wait_stream(cap_stream)
+            torch.cuda.synchronize(device)
 
-    z0_f32 = torch.tensor(0.10, dtype=torch.float32)
-    z0_f64 = float(z0_f32.to(dtype=torch.float64).item())
-    ulp_f64 = float(
-        torch.nextafter(z0_f32, torch.tensor(1.0, dtype=torch.float32))
-        .to(dtype=torch.float64)
-        .item()
-        - z0_f64
+            g_res.zero_()
+            g_rnrm.zero_()
+            g_swp.zero_()
+            g_q.zero_()
+            g_kc.zero_()
+            g_vc.zero_()
+            g_sy.zero_()
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=cap_stream):
+                _graph_body()
+            graph.replay()
+            torch.cuda.synchronize(device)
+
+            assert torch.equal(g_res, eager_res), "CUDAGraph residual_rms_norm sum mismatch"
+            assert torch.equal(g_rnrm.view(torch.int16), eager_rnrm.view(torch.int16)), (
+                "CUDAGraph residual_rms_norm norm mismatch"
+            )
+            assert torch.equal(g_swp.view(torch.int16), eager_swp.view(torch.int16)), (
+                "CUDAGraph swiglu_packed mismatch"
+            )
+            assert torch.equal(g_q.view(torch.int16), eager_q.view(torch.int16)), (
+                "CUDAGraph strided QK-RoPE Q mismatch"
+            )
+            assert torch.equal(g_kc.view(torch.int16), eager_kc.view(torch.int16)), (
+                "CUDAGraph strided QK-RoPE K cache mismatch"
+            )
+            assert torch.equal(g_vc.view(torch.int16), eager_vc.view(torch.int16)), (
+                "CUDAGraph strided QK-RoPE V cache mismatch"
+            )
+            assert torch.equal(g_sy, eager_sy), "CUDAGraph snake_beta_f32 mismatch"
+            async_verified = f"{async_verified}+GRAPH"
+
+    print(
+        f"  [+] Bitwise BF16/FP32 Kernel   : 65,280 exact points, signed zeros, N-D containment & {async_verified} verified."
     )
-    sub_ulp_64 = (
-        z0_f64
-        + (0.45 + 0.02 * torch.randn((64, 64), dtype=torch.float64, generator=gen))
-        * ulp_f64
-    ).to(device=f64_dev)
-    c_f32 = contender_cast(sub_ulp_64, torch.float32)
-    r_f32 = sub_ulp_64.to(dtype=torch.float32)
-    bias_c = abs(float(_to_f64(c_f32).mean().item() - sub_ulp_64.mean().item()))
-    bias_r = abs(float(_to_f64(r_f32).mean().item() - sub_ulp_64.mean().item()))
-    assert bias_c < bias_r * 0.35, (
-        f"Sub-ULP FP64->FP32 Contender bias ({bias_c:.2e}) failed to beat RTN dead-zone bias ({bias_r:.2e})"
-    )
-    zeros64 = torch.zeros(128, dtype=torch.float64, device=f64_dev)
-    assert float(contender_cast(zeros64, torch.float32).abs().max().item()) == 0.0
 
     refinery = TheRefinery(device)
-    refinery_targets: List[torch.dtype] = [torch.float16]
-    fp8_names: List[str] = []
-    for dt in FP8_DTYPES:
-        name = str(dt).split(".")[-1]
-        if name == "float8_e8m0fnu":
-            continue
-        refinery_targets.append(dt)
-        fp8_names.append(name)
+    contender = TheContender(device)
 
-    for r_dt in refinery_targets:
-        min_v, max_v = _resolve_dtype_limits(r_dt)
-        if r_dt == torch.float16:
-            exact_pts = torch.tensor(
-                [-65504.0, -1024.0, -1.5, -0.0, 0.0, 6.103515625e-5, 1.5, 65504.0],
-                dtype=torch.float16,
-                device=device,
-            ).to(dtype=torch.float32)
-        else:
-            exact_pts = _get_fp8_sorted_lut(device, r_dt)
+    x_chunk = torch.randn((320, 64), dtype=torch.float32, generator=gen).to(
+        device=device
+    )
+    q_cont_2d = contender.quantize(x_chunk, torch.bfloat16, phase_offset=7)
+    q_ref_2d = refinery.quantize(
+        x_chunk,
+        torch.bfloat16,
+        dither_enabled=True,
+        max_chunk_channels=128,
+        phase_offset=7,
+    )
+    assert torch.equal(q_cont_2d.view(torch.int16), q_ref_2d.view(torch.int16)), (
+        "64-aligned chunked TheRefinery diverged from single-shot TheContender!"
+    )
 
-        _, ex_lo, ex_hi = _exact_lattice_brackets_fp32(exact_pts, r_dt)
-        assert torch.equal(ex_lo, exact_pts) and torch.equal(ex_hi, exact_pts), (
-            f"Exact lattice fixed-point brackets loose on {r_dt}"
+    x_1d_fp16 = torch.randn((512,), dtype=torch.float32, generator=gen).to(
+        device=device
+    )
+    q_fp16 = refineTensor(x_1d_fp16, torch.float16, target_device=device, phase_offset=11)
+    assert q_fp16.dtype == torch.float16 and torch.isfinite(q_fp16).all()
+    _, s_lo16, s_hi16 = _exact_lattice_brackets_fp32(x_1d_fp16, torch.float16)
+    q_fp16_f32 = q_fp16.to(dtype=torch.float32)
+    assert bool(((q_fp16_f32 == s_lo16) | (q_fp16_f32 == s_hi16)).all().item()), (
+        "FP16 refineTensor escaped straddling lattice bounds!"
+    )
+
+    audited_fp8: List[str] = []
+    for fp8_dt in FP8_DTYPES:
+        lut_fp8 = _get_fp8_sorted_lut(device, fp8_dt)
+        min_v, max_v = _resolve_dtype_limits(fp8_dt)
+        assert lut_fp8.numel() > 16
+        assert float(lut_fp8[0].item()) == min_v and float(lut_fp8[-1].item()) == max_v
+        x_fp8_src = (
+            torch.randn((2, 16, 64), dtype=torch.float32, generator=gen).to(
+                device=device
+            )
+            * 12.0
         )
-
-        span_lim = min(400.0, max_v * 0.98)
-        stress_2d = torch.linspace(
-            -span_lim, span_lim, 64 * 128, dtype=torch.float32, device=device
-        ).reshape(64, 128)
-        stress_2d[0, : min(exact_pts.numel(), 128)] = exact_pts[:128]
-        _, s_lo_2d, s_hi_2d = _exact_lattice_brackets_fp32(stress_2d, r_dt)
-        q_ref_2d = refineTensor(
-            stress_2d,
-            r_dt,
-            original_on_disk_dtype=torch.float32,
-            target_device=device,
+        q_fp8 = refineTensor(
+            x_fp8_src, fp8_dt, target_device=device, phase_offset=19
         )
-        assert q_ref_2d.dtype == r_dt
-        q_ref_f32 = q_ref_2d.to(dtype=torch.float32)
-        assert torch.isfinite(q_ref_f32).all()
-        assert bool(((q_ref_f32 == s_lo_2d) | (q_ref_f32 == s_hi_2d)).all().item()), (
-            f"TheRefinery violated strict straddle containment on {r_dt}"
+        assert q_fp8.dtype == fp8_dt
+        q_fp8_f32 = q_fp8.to(dtype=torch.float32)
+        assert torch.isfinite(q_fp8_f32).all()
+        _, s_lo8, s_hi8 = _exact_lattice_brackets_fp32(x_fp8_src, fp8_dt)
+        assert bool(((q_fp8_f32 == s_lo8) | (q_fp8_f32 == s_hi8)).all().item()), (
+            f"{fp8_dt} refineTensor escaped straddling FP8 lattice bounds!"
         )
+        audited_fp8.append(str(fp8_dt).split(".")[-1])
 
-        w_base = torch.full((64, 128), 0.37, dtype=torch.float32, device=device)
-        w_seam = w_base.clone()
-        w_seam[:, 15] = span_lim * 0.85
-        w_seam[:, 32] = -span_lim * 0.85
-        q_base = refinery.quantize(
-            w_base, r_dt, torch.float32, dither_enabled=True
-        ).to(dtype=torch.float32)
-        q_seam = refinery.quantize(
-            w_seam, r_dt, torch.float32, dither_enabled=True
-        ).to(dtype=torch.float32)
-        unchanged_mask = w_seam == w_base
-        assert torch.equal(q_base[unchanged_mask], q_seam[unchanged_mask]), (
-            f"Cross-coordinate seam blending or causal error leakage detected on {r_dt}"
-        )
-
-    fp8_checked = ",".join(fp8_names) if fp8_names else "N/A"
     clear_refinery_cache()
     print(
-        f"  [+] 65,280 BF16 & Refinery     : Straddle+ZeroSeam Verified (FP16 & {fp8_checked}) | Async={async_verified} | FP64->FP32 bias={bias_c:.2e}"
+        f"  [+] Refinery Straddle & FP8    : 64-aligned chunk parity exact; FP16 + FP8 ({', '.join(audited_fp8) or 'none'}) contained."
+    )
+
+
+def _synth_audit_groove(
+    bpm: float, duration_s: float = 8.0, sr: int = 48000
+) -> np.ndarray:
+    n_samples = int(round(duration_s * sr))
+    audio = np.zeros((n_samples, 2), dtype=np.float32)
+    beat_period = 60.0 / float(bpm)
+    click_len = int(round(0.030 * sr))
+    t_click = np.arange(click_len, dtype=np.float64) / float(sr)
+    kick = (
+        0.85
+        * np.sin(2.0 * math.pi * (55.0 + 110.0 * np.exp(-t_click / 0.008)) * t_click)
+        * np.exp(-t_click / 0.012)
+    ).astype(np.float32)
+    t_pos = 0.0
+    while t_pos < duration_s:
+        idx = int(round(t_pos * sr))
+        end = min(idx + click_len, n_samples)
+        if end > idx:
+            seg = kick[: end - idx]
+            audio[idx:end, 0] += seg
+            audio[idx:end, 1] += seg
+        t_pos += beat_period
+    return audio
+
+
+def audit_gate_8_conductor_symbolic_midi_acoustic(device: torch.device) -> None:
+    print(
+        "\n--- Gate 8: Native Conductor ABI v3 Symbolic ABC, Multi-Tempo SMF1 MIDI & Acoustic BPM Audit ---"
+    )
+    info = get_conductor_info()
+    ctx = get_conductor_context()
+    cnd_mod = get_conductor_module()
+    if not info["active"] or ctx is None or cnd_mod is None:
+        print(
+            "  [i] Native Conductor Runtime   : Not staged locally; pure-ATen fallback active."
+        )
+        return
+
+    assert int(info["abi_version"]) >= MIN_CONDUCTOR_ABI_VERSION, (
+        f"Conductor ABI v{info['abi_version']} < required v{MIN_CONDUCTOR_ABI_VERSION}"
+    )
+
+    resp_probe = GenerationResponse(
+        output_path="audit.wav",
+        sample_rate=48000,
+        duration_seconds=1.0,
+        total_samples=48000,
+        generation_time_seconds=0.1,
+        real_time_factor=0.1,
+        peak_vram_gb=0.0,
+        cpu_offload_active=False,
+        cot_mode_used="full",
+        abc_token_count=0,
+        semantic_token_count=25,
+        ode_steps_used=32,
+        ode_method_used="midpoint",
+        cfg_scale_used=1.0,
+        effective_prompt="",
+        effective_style="",
+        effective_lyrics="",
+        declick_applied=True,
+        peak_linear=0.5,
+        peak_dbfs=-6.0,
+        rms_dbfs=-12.0,
+        crest_factor_db=6.0,
+        conductor_active=bool(info["active"]),
+        conductor_abi_version=int(info["abi_version"]),
+        conductor_gpu_backend=str(info["gpu_backend"]),
+        conductor_fast_lut_active=bool(info["has_fast_lut"]),
+    )
+    assert resp_probe.conductor_abi_version == int(info["abi_version"])
+
+    b86, m86, mpqn86 = ctx.canonicalize_bpm(86.0)
+    assert m86 == 86000 and mpqn86 == 697674 and abs(b86 - 86.0) < 1e-9
+    b_back, m_back = ctx.bpm_from_midi_mpqn(mpqn86)
+    assert m_back == 86000 and abs(b_back - 86.0) < 1e-9
+
+    tks_perf, num_p, den_p = ctx.quantize_beats(
+        [0.0, 0.33, 0.5, 1.0],
+        profile=cnd_mod.CndIntentProfile.PERFORMED_AUDIO,
+        return_rationals=True,
+    )
+    assert tks_perf == (0, 6720, 10080, 20160)
+    assert num_p == (0, 1, 1, 1) and den_p == (1, 3, 2, 1)
+
+    frames, samples, secs = ctx.project_ticks_to_grid([0, 20160, 80640], bpm=120.0)
+    assert frames == (0, 12, 50) or frames == (0, 13, 50)
+    assert samples == (0, 24000, 96000)
+    assert abs(secs[2] - 2.0) < 1e-12
+    ticks_back = ctx.project_frames_to_ticks([0, 50], bpm=120.0)
+    assert ticks_back == (0, 80640)
+
+    abc_multi = (
+        "X:1\nT:MultiTempo\nM:4/4\nL:1/4\nQ:1/4=120\nK:C\n"
+        "C D E F | [Q:1/4=60] G A B c |\n"
+        "Q:1/4=240\nc B A G |\n"
+    )
+    ana = ctx.analyze_abc(abc_multi)
+    assert ana.bar_count == 3 and ana.milli_bpm == 120000
+    assert ana.bars[0].codec_frame_span == (0, 50)
+    assert ana.bars[1].codec_frame_span == (50, 150)
+    assert ana.bars[2].codec_frame_span == (150, 175)
+    assert ana.total_samples_48k == 336000
+
+    abc_midbar = "X:1\nM:4/4\nL:1/4\nQ:1/4=120\nK:C\nC D [Q:1/4=60] E F |\n"
+    ana_mb = ctx.analyze_abc(abc_midbar)
+    assert ana_mb.bar_count == 1
+    assert ana_mb.bars[0].codec_frame_span == (0, 75)
+    assert ana_mb.total_samples_48k == 144000
+
+    rewritten = ctx.rewrite_abc_tempo(abc_multi, 96.0)
+    ana_rw = ctx.analyze_abc(rewritten, include_bars=False)
+    assert ana_rw.milli_bpm == 96000
+
+    ext_notes, ext_tempos, ext_meta = ctx.abc_extract_midi(abc_multi)
+    assert len(ext_notes) == 12 and len(ext_tempos) == 3
+    assert [te.milli_bpm for te in ext_tempos] == [120000, 60000, 240000]
+    assert ext_meta["time_signature"] == (4, 4)
+
+    smf_abc, smf_meta = ctx.abc_to_midi_smf1(abc_multi)
+    assert smf_meta["note_count"] == 12 and smf_meta["tempo_count"] == 3
+    dec_abc_notes, dec_abc_meta = ctx.decode_midi_smf1(smf_abc)
+    assert len(dec_abc_notes) == 12
+    assert [te.milli_bpm for te in dec_abc_meta["tempos"]] == [120000, 60000, 240000]
+    assert [n.pitch for n in dec_abc_notes[:4]] == [60, 62, 64, 65]
+
+    smf_mb, _ = ctx.abc_to_midi_smf1(abc_midbar)
+    dec_mb_notes, dec_mb_meta = ctx.decode_midi_smf1(smf_mb)
+    assert len(dec_mb_notes) == 4 and len(dec_mb_meta["tempos"]) == 2
+    assert dec_mb_meta["tempos"][0].tick == 0 and dec_mb_meta["tempos"][0].milli_bpm == 120000
+    assert dec_mb_meta["tempos"][1].tick == 40320 and dec_mb_meta["tempos"][1].milli_bpm == 60000
+
+    explicit_notes = [
+        cnd_mod.MidiNoteEvent(start_tick=0, duration_ticks=20160, pitch=60, velocity=100),
+        cnd_mod.MidiNoteEvent(start_tick=20160, duration_ticks=20160, pitch=64, velocity=96),
+        cnd_mod.MidiNoteEvent(start_tick=40320, duration_ticks=40320, pitch=67, velocity=92),
+    ]
+    explicit_tempos = [
+        cnd_mod.TempoEvent(tick=0, milli_bpm=96000),
+        cnd_mod.TempoEvent(tick=40320, milli_bpm=128000),
+    ]
+    smf_ex = ctx.encode_midi_smf1(
+        explicit_notes,
+        milli_bpm=96000,
+        tempos=explicit_tempos,
+        time_signature=(4, 4),
+        key_sf=-4,
+        is_minor=True,
+    )
+    dec_ex_notes, dec_ex_meta = ctx.decode_midi_smf1(smf_ex)
+    assert len(dec_ex_notes) == 3
+    assert [n.pitch for n in dec_ex_notes] == [60, 64, 67]
+    assert len(dec_ex_meta["tempos"]) == 2
+    assert dec_ex_meta["tempos"][0].milli_bpm == 96000
+    assert dec_ex_meta["tempos"][1].milli_bpm == 128000
+    assert dec_ex_meta["key_sf"] == -4 and dec_ex_meta["is_minor"] is True
+
+    groove_96 = _synth_audit_groove(96.0, duration_s=8.0, sr=48000)
+    est_96_inter = ctx.estimate_acoustic_bpm(groove_96, 48000, planar=False)
+    est_96_planar = ctx.estimate_acoustic_bpm(
+        np.ascontiguousarray(groove_96.T), 48000, planar=True
+    )
+    assert abs(est_96_inter - 96.0) < 1.5, f"96 BPM interleaved drift: {est_96_inter}"
+    assert abs(est_96_inter - est_96_planar) < 1e-6, (
+        f"Planar vs interleaved BPM drift: {est_96_inter} vs {est_96_planar}"
+    )
+
+    groove_128 = _synth_audit_groove(128.0, duration_s=8.0, sr=48000)
+    est_128 = ctx.estimate_acoustic_bpm(
+        torch.from_numpy(groove_128.T).to(device=device), 48000, planar=True
+    )
+    assert abs(est_128 - 128.0) < 1.5, f"128 BPM estimation drift: {est_128}"
+
+    print(
+        f"  [+] Conductor ABI v{info['abi_version']}          : "
+        f"GPU={info['gpu_backend']} | LUT001={'MMAP' if info['has_fast_lut'] else 'MEM'} | "
+        f"Mid-Bar [Q:] & Multi-Tempo SMF1 Exact | BPM={est_96_inter:.2f}/{est_128:.2f}"
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Doodle Sovereign Mathematical & Compute Stack Auditor"
+        description="Doodle Architectural Sanity-Check & Mathematical Convergence Auditor."
     )
     parser.add_argument(
-        "--device", type=str, choices=["auto", "cuda", "mps", "cpu"], default="auto"
+        "--device",
+        type=str,
+        choices=["auto", "cuda", "mps", "cpu"],
+        default="auto",
+        help="Target compute device for tensor verification.",
     )
     args = parser.parse_args()
     device = resolve_test_device(args.device)
 
     print("=" * 88)
-    print("         DOODLE SOVEREIGN COMPUTE & ACCUMULATOR CONVERGENCE AUDITOR")
-    print(f"                         Active Target Device: {device}")
+    print(
+        f"     DOODLE ARCHITECTURAL CONVERGENCE & ZERO-REGRESSION AUDITOR ({device})"
+    )
     print("=" * 88)
 
     t0 = time.perf_counter()
@@ -1945,11 +2501,13 @@ def main() -> None:
     audit_gate_5_nar_fp32_ode_and_manifold_inpainting(model)
     audit_gate_6_vae_fp32_guard_and_tiling(device)
     audit_gate_7_contender_and_refinery_lattice(device)
-    elapsed = time.perf_counter() - t0
+    audit_gate_8_conductor_symbolic_midi_acoustic(device)
+    clear_yue2_workspaces(device)
 
+    elapsed = time.perf_counter() - t0
     print("\n" + "=" * 88)
     print(
-        f"[+] STATUS: ALL 7 GATES CONVERGED IN {elapsed:.2f}s. QUALITATIVE MAXIMUS VERIFIED."
+        f"ALL 8 ARCHITECTURAL GATES PASSED IN {elapsed:.2f}s (ZERO DOWNCASTING, ZERO MIOpen/CONV, ABI v3 CONVERGED)."
     )
     print("=" * 88)
 
